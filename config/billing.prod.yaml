@@ -1,0 +1,40 @@
+schema_version: 1
+environment: prod
+currency: USD
+
+topup_packages:
+  credit_5_usd:
+    display_name: "$5 token credit"
+    stripe_price_id: price_1U3ZHnB5Es3VU3maoEQbMKnC
+    amount_cents: 500
+    credit_nanos: 5000000000
+  credit_10_usd:
+    display_name: "$10 token credit"
+    stripe_price_id: price_1U3ZKOB5Es3VU3maflfGkdrX
+    amount_cents: 1000
+    credit_nanos: 10000000000
+  credit_25_usd:
+    display_name: "$25 token credit"
+    stripe_price_id: price_1U3ZLMB5Es3VU3maaNqqR0p9
+    amount_cents: 2500
+    credit_nanos: 25000000000
+
+monthly_service_fee:
+  stripe_price_id: price_1U3ZYBB5Es3VU3maSP6qq6sg
+  amount_cents: 500
+  fee_nanos: 5000000000
+  interval: month
+
+models:
+  gemini-3.8-flash:
+    input_usd_per_million: 0.75
+    output_usd_per_million: 3.75
+  gemini-3.7-flash:
+    input_usd_per_million: 0.75
+    output_usd_per_million: 3.75
+  gemini-3.5-flash:
+    input_usd_per_million: 1.50
+    output_usd_per_million: 9.00
+  gemini-2.5-flash:
+    input_usd_per_million: 0.30
+    output_usd_per_million: 2.50

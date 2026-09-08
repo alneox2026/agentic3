@@ -1,0 +1,13 @@
+.git
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+.env
+.env.*
+
+adkagents
+docs
+infra
+scripts
+tests

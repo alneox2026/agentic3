@@ -1,0 +1,16 @@
+# Build only the public Stripe Billing API image.  Override _IMAGE when
+# deploying a non-default project, repository, or immutable release tag.
+substitutions:
+  _IMAGE: "us-central1-docker.pkg.dev/ceo-dev123/ceosystem/managed-agents-billing-api:latest"
+
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--file=services/billing_api_v3/Dockerfile"
+      - "--tag=${_IMAGE}"
+      - "."
+
+images:
+  - "${_IMAGE}"

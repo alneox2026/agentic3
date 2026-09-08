@@ -1,0 +1,33 @@
+agents:
+  # General-purpose Google Antigravity Agent (autonomous loops, code execution, web browsing, Linux sandbox)
+  antigravity_agent:
+    agent_id: antigravity_agent
+    backend: gemini_managed
+    remote_agent_id: antigravity-preview-05-2026
+    model: gemini-3.8-flash
+    max_total_tokens: 50000
+    streaming_enabled: true
+    persistence_enabled: true
+    auth_policy: firebase
+
+  # Custom Managed Agent example (invoked by registered agent ID)
+  data_analyst:
+    agent_id: data_analyst
+    backend: gemini_managed
+    remote_agent_id: data-analyst
+    model: gemini-3.8-flash
+    max_total_tokens: 50000
+    streaming_enabled: true
+    persistence_enabled: true
+    auth_policy: firebase
+
+  # Custom Managed Agent example: Code Assistant
+  code_assistant:
+    agent_id: code_assistant
+    backend: gemini_managed
+    remote_agent_id: code-assistant
+    model: gemini-3.8-flash
+    max_total_tokens: 50000
+    streaming_enabled: true
+    persistence_enabled: true
+    auth_policy: firebase

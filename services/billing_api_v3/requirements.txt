@@ -1,0 +1,6 @@
+fastapi>=0.116.0,<1.0.0
+uvicorn[standard]>=0.35.0,<1.0.0
+firebase-admin>=7.0.0,<8.0.0
+google-cloud-firestore>=2.21.0,<3.0.0
+PyYAML>=6.0.0,<7.0.0
+stripe>=14.0.0,<15.0.0
