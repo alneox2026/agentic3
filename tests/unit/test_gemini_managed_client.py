@@ -62,6 +62,17 @@ async def test_build_interaction_payload(managed_agent_config: AgentConfig):
 
 
 @pytest.mark.anyio
+async def test_build_interaction_payload_default_environment(managed_agent_config: AgentConfig):
+    client = GeminiManagedClient()
+    payload = client._build_interaction_payload(
+        agent_config=managed_agent_config,
+        message="Analyze this CSV",
+        stream=True,
+    )
+    assert payload["environment"] == "remote"
+
+
+@pytest.mark.anyio
 async def test_chat_buffered_query(managed_agent_config: AgentConfig, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-12345")
     mock_response = MagicMock(spec=httpx.Response)

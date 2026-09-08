@@ -161,7 +161,7 @@ def _elapsed_ms(started_at: datetime) -> int:
 def _safe_log_reason(details: dict | None) -> str | None:
     if not isinstance(details, dict):
         return None
-    reason = details.get("reason")
+    reason = details.get("reason") or details.get("detail")
     if reason is None:
         return None
     return str(reason)[:MAX_LOG_REASON_LENGTH]
@@ -488,7 +488,7 @@ async def stream_chat(
                 upstream_first_event_latency_ms=diagnostics.upstream_first_event_latency_ms,
                 first_token_latency_ms=diagnostics.first_token_latency_ms,
                 upstream_sse_message_count=diagnostics.upstream_sse_message_count,
-                reason=_safe_log_reason(exc.details),
+                reason=_safe_log_reason(exc.details) or (str(exc.message)[:MAX_LOG_REASON_LENGTH] if getattr(exc, "message", None) else None),
             )
             _emit_stream_debug_log(
                 enabled=settings.stream_debug,

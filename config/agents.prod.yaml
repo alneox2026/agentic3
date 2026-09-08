@@ -6,6 +6,7 @@ agents:
     remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
@@ -17,6 +18,7 @@ agents:
     remote_agent_id: data-analyst
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
@@ -28,6 +30,7 @@ agents:
     remote_agent_id: code-assistant
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase

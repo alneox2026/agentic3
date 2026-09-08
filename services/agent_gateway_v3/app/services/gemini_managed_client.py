@@ -150,7 +150,7 @@ class GeminiManagedClient:
                         response.status_code,
                         "managed_agent_upstream_error",
                         f"Gemini Interactions API returned error {response.status_code}: {error_text}",
-                        {"status_code": response.status_code, "detail": error_text},
+                        {"status_code": response.status_code, "detail": error_text, "reason": error_text},
                     )
 
                 event_name: str | None = None
@@ -276,6 +276,8 @@ class GeminiManagedClient:
             payload["environment"] = environment_id
         elif agent_config.environment:
             payload["environment"] = agent_config.environment
+        else:
+            payload["environment"] = "remote"
 
         if agent_config.system_instruction:
             payload["system_instruction"] = agent_config.system_instruction
@@ -329,7 +331,7 @@ class GeminiManagedClient:
                         response.status_code,
                         "managed_agent_upstream_error",
                         f"Gemini Interactions API error {response.status_code}: {response.text}",
-                        {"status_code": response.status_code, "detail": response.text},
+                        {"status_code": response.status_code, "detail": response.text, "reason": response.text},
                     )
                 return response
             except (httpx.ConnectError, httpx.ReadTimeout) as exc:
