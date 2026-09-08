@@ -6,28 +6,33 @@ agents:
     remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
 
-  # Custom Managed Agent example (invoked by registered agent ID)
+  # Custom Managed Agent: Data Analyst
   data_analyst:
     agent_id: data_analyst
     backend: gemini_managed
-    remote_agent_id: data-analyst
+    remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
+    system_instruction: "You are an expert data analyst and business intelligence specialist. You analyze data, generate actionable insights, summarize metrics, and create clear data presentations."
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
 
-  # Custom Managed Agent example: Code Assistant
+  # Custom Managed Agent: Code Assistant
   code_assistant:
     agent_id: code_assistant
     backend: gemini_managed
-    remote_agent_id: code-assistant
+    remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 50000
+    environment: remote
+    system_instruction: "You are an expert full-stack software engineer and code assistant. You write clean, well-architected code, debug complex errors, and explain technical solutions clearly."
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
