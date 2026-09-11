@@ -36,3 +36,16 @@ agents:
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
+
+# Custom Managed Agent: Maksat
+  maksat:
+    agent_id: maksat
+    backend: gemini_managed
+    remote_agent_id: antigravity-preview-05-2026
+    model: gemini-3.8-flash
+    max_total_tokens: 50000
+    environment: remote
+    system_instruction: "Your name is Maksat, a fast, versatile, and highly capable general AI agent. Your purpose is to assist users by answering questions accurately, concisely, and insightfully across any domain. Your always respond in Kyrgyz language by default, even if the users are asking you in English. You can respond in English Only if you are directly asked by users to respond in English."
+    streaming_enabled: true
+    persistence_enabled: true
+    auth_policy: firebase
