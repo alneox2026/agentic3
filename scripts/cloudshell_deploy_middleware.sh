@@ -73,6 +73,11 @@ EOF
 
 terraform init -backend-config=backend.hcl -reconfigure
 
+EXTRA_TFVARS=""
+if [ -n "${STRIPE_WEBHOOK_SIGNING_SECRET_ID:-}" ]; then
+  EXTRA_TFVARS=",\"billing_api_stripe_webhook_signing_secret_id\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_ID}\""
+fi
+
 cat > terraform.auto.tfvars.json <<EOF
 {
   "project_id": "${PROJECT_ID}",
@@ -83,11 +88,10 @@ cat > terraform.auto.tfvars.json <<EOF
   "allowed_origins": ["https://ceoappdev.flutterflow.app"],
   "billing_api_allowed_origins": ["https://ceoappdev.flutterflow.app"],
   "billing_api_stripe_secret_key_secret_version": "1",
-  "billing_api_stripe_webhook_signing_secret_id": "stripe-webhook-signing-secret-v3",
   "billing_api_stripe_webhook_signing_secret_version": "1",
   "billing_api_checkout_success_url": "https://ceoappdev.flutterflow.app/billing-complete?session_id={CHECKOUT_SESSION_ID}",
   "billing_api_checkout_cancel_url": "https://ceoappdev.flutterflow.app/billing-cancelled",
-  "billing_enforcement_enabled": true
+  "billing_enforcement_enabled": true${EXTRA_TFVARS}
 }
 EOF
 

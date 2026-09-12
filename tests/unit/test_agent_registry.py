@@ -27,7 +27,7 @@ def test_get_agent_config_returns_data_analyst() -> None:
     config = get_agent_config("data_analyst")
     assert config.agent_id == "data_analyst"
     assert config.backend == "gemini_managed"
-    assert config.remote_agent_id == "data-analyst"
+    assert config.remote_agent_id == "antigravity-preview-05-2026"
     assert config.model == "gemini-3.8-flash"
     assert config.streaming_enabled is True
 
@@ -36,9 +36,22 @@ def test_get_agent_config_returns_code_assistant() -> None:
     config = get_agent_config("code_assistant")
     assert config.agent_id == "code_assistant"
     assert config.backend == "gemini_managed"
-    assert config.remote_agent_id == "code-assistant"
+    assert config.remote_agent_id == "antigravity-preview-05-2026"
     assert config.model == "gemini-3.8-flash"
     assert config.max_total_tokens == 50000
+
+
+def test_get_agent_config_returns_constitution_expert() -> None:
+    config = get_agent_config("constitution_expert")
+    assert config.agent_id == "constitution_expert"
+    assert config.backend == "gemini_managed"
+    assert config.remote_agent_id == "antigravity-preview-05-2026"
+    assert config.model == "gemini-3.8-flash"
+    assert isinstance(config.environment, dict)
+    assert config.environment["type"] == "remote"
+    assert len(config.environment["sources"]) == 1
+    assert config.environment["sources"][0]["source"] == "https://github.com/alneox2026/ragagent1"
+    assert config.environment["sources"][0]["target"] == "/workspace/constitution"
 
 
 def test_get_agent_config_rejects_unknown_agent() -> None:

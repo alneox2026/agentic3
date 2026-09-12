@@ -188,3 +188,74 @@ def test_later_topup_is_payment_only_after_monthly_subscription_is_active():
         {"price": "price_1U3ZKOB5Es3VU3maflfGkdrX", "quantity": 1}
     ]
     assert params["payment_intent_data"]["metadata"]["checkout_kind"] == "topup"
+
+
+def test_topup_when_subscription_pending_activation_is_payment_only():
+    client = FakeFirestore()
+    stripe = FakeStripeGateway()
+    service = _service(client, stripe)
+    account_id = customer_billing_account_document_id("user-1")
+    client.documents[("customer_billing_accounts", account_id)] = {
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "catalog_environment": "test",
+        "stripe_customer_id": "cus_test_123",
+        "stripe_subscription_id": "sub_test_123",
+        "stripe_subscription_status": "pending_activation",
+        "active_checkout_request_id": None,
+        "active_checkout_session_id": None,
+        "active_checkout_url": None,
+        "active_checkout_mode": None,
+        "active_checkout_topup_package_id": None,
+        "active_checkout_created_at": None,
+        "active_checkout_expires_at": None,
+    }
+
+    result = asyncio.run(
+        service.create_topup_checkout(owner_uid="user-1", topup_package_id="credit_5_usd")
+    )
+
+    assert result.starts_subscription is False
+    params, _ = stripe.checkout_requests[0]
+    assert params["mode"] == "payment"
+    assert params["line_items"] == [
+        {"price": "price_1U3ZHnB5Es3VU3maoEQbMKnC", "quantity": 1}
+    ]
+    assert params["payment_intent_data"]["metadata"]["checkout_kind"] == "topup"
+
+
+def test_topup_when_subscription_canceled_restarts_subscription():
+    client = FakeFirestore()
+    stripe = FakeStripeGateway()
+    service = _service(client, stripe)
+    account_id = customer_billing_account_document_id("user-1")
+    client.documents[("customer_billing_accounts", account_id)] = {
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "catalog_environment": "test",
+        "stripe_customer_id": "cus_test_123",
+        "stripe_subscription_id": "sub_old_123",
+        "stripe_subscription_status": "canceled",
+        "active_checkout_request_id": None,
+        "active_checkout_session_id": None,
+        "active_checkout_url": None,
+        "active_checkout_mode": None,
+        "active_checkout_topup_package_id": None,
+        "active_checkout_created_at": None,
+        "active_checkout_expires_at": None,
+    }
+
+    result = asyncio.run(
+        service.create_topup_checkout(owner_uid="user-1", topup_package_id="credit_5_usd")
+    )
+
+    assert result.starts_subscription is True
+    params, _ = stripe.checkout_requests[0]
+    assert params["mode"] == "subscription"
+    assert len(params["line_items"]) == 2
+    assert params["subscription_data"]["metadata"]["checkout_kind"] == "initial_subscription_topup"
+

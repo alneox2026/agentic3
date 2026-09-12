@@ -411,16 +411,10 @@ class CheckoutService:
 
     def _starts_subscription(self, account: Mapping[str, Any]) -> bool:
         subscription_id = _optional_string(account.get("stripe_subscription_id"))
-        status = str(account.get("stripe_subscription_status", "not_started"))
-        if subscription_id is None:
-            return True
-        if status in {"active", "trialing"}:
+        status = str(account.get("stripe_subscription_status", "not_started")).strip().lower()
+        if subscription_id and status in {"active", "trialing", "pending_activation"}:
             return False
-        raise BillingApiError(
-            403,
-            "monthly_service_fee_required",
-            "Your monthly service-fee subscription must be active before adding more credit.",
-        )
+        return True
 
     def _validate_billing_account(
         self,
