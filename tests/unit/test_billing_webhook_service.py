@@ -299,3 +299,67 @@ def test_subscription_state_uses_the_current_server_retrieved_subscription():
     assert result.outcome == "subscription_state_updated"
     account = client.documents[("customer_billing_accounts", account_id)]
     assert account["stripe_subscription_status"] == "active"
+
+
+def test_subsequent_topup_credits_existing_wallet_successfully():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    topup_event = {
+        "id": "evt_topup_second",
+        "type": "checkout.session.completed",
+        "created": 1786492900,
+        "livemode": False,
+        "data": {"object": {"id": "cs_second_123"}},
+    }
+    checkout_session = {
+        "id": "cs_second_123",
+        "livemode": False,
+        "mode": "payment",
+        "payment_status": "paid",
+        "customer": "cus_test_123",
+        "payment_intent": "pi_second_123",
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "checkout_kind": "topup",
+            "topup_package_id": "credit_10_usd",
+        },
+        "line_items": {
+            "data": [
+                {"price": "price_1U3ZKOB5Es3VU3maflfGkdrX", "quantity": 1},
+            ]
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+        "last_credit_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"second_topup": topup_event},
+        checkout_sessions={"cs_second_123": checkout_session},
+        invoices={},
+        subscriptions={},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"second_topup", stripe_signature="signature")
+
+    assert result.outcome == "topup_credited"
+    assert result.duplicate is False
+
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["available_credit_nanos"] == 15_000_000_000
+    assert wallet["lifetime_credited_nanos"] == 15_000_000_000

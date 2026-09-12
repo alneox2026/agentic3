@@ -1086,6 +1086,18 @@ class StripeWebhookService:
             raise BillingApiError(400, "stripe_customer_mismatch", "Stripe event customer does not match the billing account.")
         return owner_uid
 
+    def _validate_wallet(
+        self,
+        wallet: Mapping[str, Any],
+        owner_uid: str,
+    ) -> None:
+        if (
+            wallet.get("owner_uid") != owner_uid
+            or wallet.get("billing_subject_id") != owner_uid
+            or wallet.get("currency") != "USD"
+        ):
+            raise BillingApiError(400, "wallet_invalid", "Wallet record does not match the billing account.")
+
     def _event_identity(
         self,
         event: Mapping[str, Any],
