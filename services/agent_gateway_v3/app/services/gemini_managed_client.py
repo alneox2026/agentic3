@@ -242,6 +242,37 @@ class GeminiManagedClient:
                                 if isinstance(part, dict) and "text" in part:
                                     fragments.append(str(part["text"]))
 
+        # Nested interaction wrapper (e.g. interaction.completed or full interaction payload)
+        interaction = event_payload.get("interaction")
+        if isinstance(interaction, dict):
+            if "output_text" in interaction and isinstance(interaction["output_text"], str):
+                fragments.append(interaction["output_text"])
+            elif "text" in interaction and isinstance(interaction["text"], str):
+                fragments.append(interaction["text"])
+            outputs = interaction.get("outputs")
+            if isinstance(outputs, list):
+                for out in outputs:
+                    if isinstance(out, dict) and "text" in out and isinstance(out["text"], str):
+                        fragments.append(out["text"])
+
+        # Step wrapper (e.g. step.completed or step delta)
+        step = event_payload.get("step")
+        if isinstance(step, dict):
+            if "output_text" in step and isinstance(step["output_text"], str):
+                fragments.append(step["output_text"])
+            elif "text" in step and isinstance(step["text"], str):
+                fragments.append(step["text"])
+            step_delta = step.get("delta")
+            if isinstance(step_delta, dict) and "text" in step_delta and isinstance(step_delta["text"], str):
+                fragments.append(step_delta["text"])
+
+        # Outputs list directly on event_payload
+        outputs = event_payload.get("outputs")
+        if isinstance(outputs, list):
+            for out in outputs:
+                if isinstance(out, dict) and "text" in out and isinstance(out["text"], str):
+                    fragments.append(out["text"])
+
         return fragments
 
     def _build_interaction_payload(
@@ -256,7 +287,7 @@ class GeminiManagedClient:
         """Constructs the JSON request body for POST /v1beta/interactions."""
         agent_identifier = agent_config.remote_agent_id or "antigravity-preview-05-2026"
         model_name = agent_config.model or "gemini-3.8-flash"
-        max_tokens = agent_config.max_total_tokens or 50000
+        max_tokens = agent_config.max_total_tokens or 300000
 
         payload: dict[str, Any] = {
             "agent": agent_identifier,

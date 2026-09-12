@@ -168,3 +168,47 @@ async def test_stream_chat_events(managed_agent_config: AgentConfig, monkeypatch
     assert assembler.usage["token_counts"]["prompt_token_count"] == 50
     assert assembler.usage["token_counts"]["candidates_token_count"] == 25
     assert assembler.usage["estimated_cost_usd"] > 0
+
+
+def test_extract_text_fragments_nested_formats():
+    client = GeminiManagedClient()
+
+    # Interaction with output_text
+    payload_interaction_output_text = {
+        "interaction": {
+            "id": "int_1",
+            "status": "completed",
+            "output_text": "The Constitution of the Kyrgyz Republic was adopted...",
+        }
+    }
+    assert client.extract_text_fragments(payload_interaction_output_text) == [
+        "The Constitution of the Kyrgyz Republic was adopted..."
+    ]
+
+    # Interaction with outputs list
+    payload_interaction_outputs = {
+        "interaction": {
+            "id": "int_2",
+            "outputs": [{"text": "Part 1: Article 1."}, {"text": "Part 2: Article 2."}],
+        }
+    }
+    assert client.extract_text_fragments(payload_interaction_outputs) == [
+        "Part 1: Article 1.",
+        "Part 2: Article 2.",
+    ]
+
+    # Step with output_text
+    payload_step = {
+        "step": {
+            "id": "step_1",
+            "output_text": "Step output text.",
+        }
+    }
+    assert client.extract_text_fragments(payload_step) == ["Step output text."]
+
+    # Direct outputs list
+    payload_direct_outputs = {
+        "outputs": [{"text": "Direct output."}]
+    }
+    assert client.extract_text_fragments(payload_direct_outputs) == ["Direct output."]
+
