@@ -944,15 +944,45 @@ class StripeWebhookService:
         if metadata.get("catalog_environment") != self._catalog.environment:
             raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
 
-        # For combined charges (subscription + top-up), a partial refund
-        # cannot reliably determine which portion is credit vs. service fee.
-        # Only prorate when the charge has a topup_package_id and no
-        # subscription line item bundled.
+        # For combined charges (subscription fee + initial top-up credit),
+        # never calculate a wallet reversal from raw cents.
         checkout_kind = metadata.get("checkout_kind", "")
         is_combined_charge = checkout_kind == "initial_subscription_topup"
         topup_package_id = _optional_id(metadata.get("topup_package_id"))
 
-        if topup_package_id and not is_combined_charge:
+        service_fee_reversed_cents = 0
+        requires_manual_review = False
+        review_reason: str | None = None
+
+        if is_combined_charge:
+            package = None
+            if topup_package_id:
+                try:
+                    package = self._catalog.get_topup_package(topup_package_id)
+                except Exception:
+                    package = None
+
+            if amount_refunded_cents >= amount_cents:
+                # Full refund of combined checkout:
+                # Reverse at most the credited token amount; separately record service-fee portion.
+                if package is not None:
+                    reversed_nanos = package.credit_nanos
+                    service_fee_reversed_cents = max(0, amount_refunded_cents - package.amount_cents)
+                else:
+                    reversed_nanos = 0
+                    service_fee_reversed_cents = amount_refunded_cents
+                    requires_manual_review = True
+                    review_reason = "missing_topup_package_on_combined_refund"
+            else:
+                # Partial refund of combined checkout:
+                # Cannot determine whether refund applies to service fee or wallet credit.
+                # Never calculate wallet reversal from raw cents. Suspend wallet and flag for review.
+                reversed_nanos = 0
+                service_fee_reversed_cents = 0
+                requires_manual_review = True
+                review_reason = "partial_combined_refund"
+        elif topup_package_id:
+            # Standalone topup refund: prorate or reverse exact credit nanos
             try:
                 package = self._catalog.get_topup_package(topup_package_id)
                 if amount_cents > 0 and amount_refunded_cents < amount_cents:
@@ -962,8 +992,10 @@ class StripeWebhookService:
             except Exception:
                 reversed_nanos = amount_refunded_cents * 10_000_000
         else:
-            # For combined or fee-only charges, use the raw cent amount.
-            reversed_nanos = amount_refunded_cents * 10_000_000
+            # Fee-only or other charge with no topup package: no wallet credit was ever granted,
+            # so reversing wallet credit would be an over-debit.
+            reversed_nanos = 0
+            service_fee_reversed_cents = amount_refunded_cents
 
         client = self._firestore_client_factory()
         account_ref = client.collection(self._settings.billing_accounts_collection).document(
@@ -1020,6 +1052,11 @@ class StripeWebhookService:
                     field_name="available_credit_nanos",
                 )
                 new_available = available_credit - reversed_nanos
+                existing_reasons = list(wallet.get("suspension_reasons") or [])
+                existing_reason = wallet.get("suspension_reason")
+                if existing_reason and existing_reason not in existing_reasons:
+                    existing_reasons.append(existing_reason)
+
                 wallet_updates: dict[str, Any] = {
                     "available_credit_nanos": new_available,
                     "updated_at": processed_at,
@@ -1027,27 +1064,51 @@ class StripeWebhookService:
                 }
                 if new_available < 0:
                     wallet_updates["status"] = "suspended"
+                    if "refund_debt" not in existing_reasons:
+                        existing_reasons.append("refund_debt")
                     wallet_updates["suspension_reason"] = "refund_debt"
+                    wallet_updates["suspension_reasons"] = existing_reasons
+                elif requires_manual_review:
+                    wallet_updates["status"] = "suspended"
+                    if "partial_combined_refund" not in existing_reasons:
+                        existing_reasons.append("partial_combined_refund")
+                    wallet_updates["suspension_reason"] = "partial_combined_refund"
+                    wallet_updates["suspension_reasons"] = existing_reasons
+                    wallet_updates["review_required"] = True
+                    wallet_updates["review_reason"] = review_reason
+
                 transaction.update(wallet_ref, wallet_updates)
 
-            transaction.create(
-                transaction_ref,
-                {
-                    "schema_version": 1,
-                    "transaction_id": transaction_id,
-                    "transaction_type": "stripe_charge_refund",
-                    "status": "posted",
-                    "billing_subject_id": owner_uid,
-                    "owner_uid": owner_uid,
-                    "wallet_document_id": customer_wallet_document_id(owner_uid),
-                    "currency": "USD",
-                    "amount_nanos": -reversed_nanos,
-                    "stripe_amount_cents": -amount_refunded_cents,
-                    "stripe_event_id": stripe_event_id,
-                    "stripe_charge_id": charge_id,
-                    "created_at": processed_at,
-                },
-            )
+            if requires_manual_review:
+                transaction.update(
+                    account_ref,
+                    {
+                        "review_required": True,
+                        "review_reason": review_reason,
+                        "updated_at": processed_at,
+                    },
+                )
+
+            tx_doc: dict[str, Any] = {
+                "schema_version": 1,
+                "transaction_id": transaction_id,
+                "transaction_type": "stripe_charge_refund",
+                "status": "posted",
+                "billing_subject_id": owner_uid,
+                "owner_uid": owner_uid,
+                "wallet_document_id": customer_wallet_document_id(owner_uid),
+                "currency": "USD",
+                "amount_nanos": -reversed_nanos,
+                "stripe_amount_cents": -amount_refunded_cents,
+                "stripe_event_id": stripe_event_id,
+                "stripe_charge_id": charge_id,
+                "service_fee_reversed_cents": service_fee_reversed_cents,
+                "created_at": processed_at,
+            }
+            if requires_manual_review:
+                tx_doc["review_required"] = True
+                tx_doc["review_reason"] = review_reason
+            transaction.create(transaction_ref, tx_doc)
             transaction.create(
                 event_ref,
                 build_stripe_webhook_event_document(
@@ -1149,15 +1210,27 @@ class StripeWebhookService:
                 )
 
             if wallet_snapshot.exists:
-                transaction.update(
-                    wallet_ref,
-                    {
-                        "status": "suspended",
-                        "suspension_reason": "dispute",
-                        "updated_at": processed_at,
-                        "last_dispute_at": processed_at,
-                    },
-                )
+                wallet = wallet_snapshot.to_dict() or {}
+                existing_status = wallet.get("status")
+                existing_reason = wallet.get("suspension_reason")
+                existing_reasons = list(wallet.get("suspension_reasons") or [])
+                if existing_reason and existing_reason not in existing_reasons:
+                    existing_reasons.append(existing_reason)
+                if "dispute" not in existing_reasons:
+                    existing_reasons.append("dispute")
+
+                wallet_updates: dict[str, Any] = {
+                    "status": "suspended",
+                    "suspension_reasons": existing_reasons,
+                    "updated_at": processed_at,
+                    "last_dispute_at": processed_at,
+                }
+                # Refuse to overwrite an existing non-dispute suspension reason (e.g. refund_debt)
+                if existing_status == "suspended" and existing_reason and existing_reason != "dispute":
+                    wallet_updates["suspension_reason"] = existing_reason
+                else:
+                    wallet_updates["suspension_reason"] = "dispute"
+                transaction.update(wallet_ref, wallet_updates)
 
             transaction.create(
                 transaction_ref,
@@ -1264,22 +1337,44 @@ class StripeWebhookService:
 
             if status == "won" and wallet_snapshot.exists:
                 wallet = wallet_snapshot.to_dict() or {}
-                # Only reinstate if the wallet was suspended specifically
-                # for a dispute; other suspension reasons (refund_debt,
-                # manual, etc.) must be resolved separately.
-                if (
-                    wallet.get("status") == "suspended"
-                    and wallet.get("suspension_reason") == "dispute"
-                ):
-                    transaction.update(
-                        wallet_ref,
-                        {
-                            "status": "active",
-                            "suspension_reason": None,
-                            "updated_at": processed_at,
-                            "dispute_reinstated_at": processed_at,
-                        },
-                    )
+                existing_reasons = [r for r in (wallet.get("suspension_reasons") or []) if r != "dispute"]
+                available_credit = int(wallet.get("available_credit_nanos", 0))
+                has_refund_debt = available_credit < 0 or wallet.get("suspension_reason") == "refund_debt" or "refund_debt" in existing_reasons
+
+                if wallet.get("status") == "suspended":
+                    # Only reinstate to active if no other suspension causes remain (not in debt, no remaining reasons)
+                    # and the primary suspension reason was dispute (or None)
+                    if (
+                        not has_refund_debt
+                        and not existing_reasons
+                        and wallet.get("suspension_reason") in ("dispute", None)
+                    ):
+                        transaction.update(
+                            wallet_ref,
+                            {
+                                "status": "active",
+                                "suspension_reason": None,
+                                "suspension_reasons": [],
+                                "updated_at": processed_at,
+                                "dispute_reinstated_at": processed_at,
+                            },
+                        )
+                    else:
+                        # Retain suspension for remaining reasons (e.g. refund_debt)
+                        retained_reason = (
+                            "refund_debt"
+                            if has_refund_debt
+                            else (existing_reasons[0] if existing_reasons else wallet.get("suspension_reason"))
+                        )
+                        transaction.update(
+                            wallet_ref,
+                            {
+                                "suspension_reason": retained_reason,
+                                "suspension_reasons": existing_reasons,
+                                "updated_at": processed_at,
+                                "dispute_reinstated_at": processed_at,
+                            },
+                        )
 
             transaction.create(
                 event_ref,

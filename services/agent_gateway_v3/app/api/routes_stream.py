@@ -9,6 +9,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import suppress
 
+import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
@@ -165,6 +166,26 @@ def _safe_log_reason(details: dict | None) -> str | None:
     if reason is None:
         return None
     return str(reason)[:MAX_LOG_REASON_LENGTH]
+
+
+def _is_pre_request_failure(exc: Exception) -> bool:
+    """Returns True only if the failure is confirmed to have occurred before
+
+    the upstream service received or accepted the request (e.g. connection timeout,
+    connection refused, host unreachable). Timeouts during read or failures after
+    request acceptance are NOT pre-request failures and must be retained for reconciliation.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    if isinstance(exc, ApiError):
+        details = exc.details or {}
+        if details.get("timeout_type") == "connect":
+            return True
+        if exc.code.endswith("_connect_timeout"):
+            return True
+        if exc.code.endswith("_unreachable"):
+            return True
+    return False
 
 
 def _build_waiting_status_payload(
@@ -503,12 +524,11 @@ async def stream_chat(
                 outcome="api_error",
             )
             if billing_reservation:
-                # Release the hold only if the upstream call never began
-                # (no SSE messages received). Once the upstream accepted
-                # the request, the model may have incurred cost even
-                # without emitting text tokens (e.g. safety blocks,
-                # timeouts after model execution).
-                if diagnostics.upstream_sse_message_count == 0:
+                # Release the hold only on a confirmed pre-request failure
+                # (e.g. connection timeout or connect error before request reached model).
+                # Once the connection was established, a post-acceptance timeout or error
+                # could have incurred model cost; retain the reservation for reconciliation.
+                if _is_pre_request_failure(exc):
                     with suppress(Exception):
                         await wallet_reservation_service.release(billing_reservation)
                 else:
@@ -537,7 +557,7 @@ async def stream_chat(
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             if billing_reservation:
-                if diagnostics.upstream_sse_message_count == 0:
+                if _is_pre_request_failure(exc):
                     with suppress(Exception):
                         await wallet_reservation_service.release(billing_reservation)
                 else:

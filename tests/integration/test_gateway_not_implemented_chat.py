@@ -103,6 +103,7 @@ class FakePublisher:
 class FakeWalletReservationService:
     def __init__(self):
         self.calls: list[dict[str, object]] = []
+        self.releases: list[object] = []
 
     async def reserve(self, **kwargs):
         self.calls.append(kwargs)
@@ -114,6 +115,9 @@ class FakeWalletReservationService:
                 "currency": "USD",
             }
         )
+
+    async def release(self, reservation):
+        self.releases.append(reservation)
 
 
 async def _fake_authenticate_request(request) -> str:
@@ -611,3 +615,92 @@ def test_stream_chat_debug_log_captures_upstream_shape_without_text(monkeypatch)
     ]
     assert debug_log["upstream_fragment_lengths"] == [[], [len("echo:hello")]]
     assert "echo:hello" not in str(debug_log)
+
+
+def test_stream_chat_releases_reservation_on_confirmed_connect_timeout(monkeypatch) -> None:
+    """A confirmed pre-request connect timeout must release the billing reservation."""
+    connect_error = ApiError(
+        504,
+        "agent_runtime_stream_connect_timeout",
+        "The gateway timed out while opening a streaming connection.",
+        {"timeout_type": "connect", "reason": "connect timed out"},
+    )
+    reservation_service = FakeWalletReservationService()
+
+    monkeypatch.setattr(routes_stream, "authenticate_request", _fake_authenticate_request)
+    _enable_streaming_route(monkeypatch)
+    monkeypatch.setattr(
+        routes_stream,
+        "get_streaming_chat_backend_client",
+        lambda _agent_config: _make_runtime_client(
+            stream_error=connect_error,
+            fallback_error=RuntimeError("no fallback"),
+        )(),
+    )
+    monkeypatch.setattr(routes_stream, "get_pubsub_publisher", _fake_get_pubsub_publisher)
+    monkeypatch.setattr(
+        routes_stream,
+        "get_wallet_reservation_service",
+        _fake_get_wallet_reservation_service(reservation_service),
+    )
+    monkeypatch.setattr(
+        routes_stream,
+        "get_settings",
+        lambda: SimpleNamespace(
+            stream_debug=False,
+            upstream_connect_timeout_seconds=10,
+            upstream_read_timeout_seconds=240,
+        ),
+    )
+
+    response = client.post("/v1/agents/antigravity_agent/chat/stream", json={"message": "hello"})
+
+    assert response.status_code == 200
+    assert '"code": "agent_runtime_stream_connect_timeout"' in response.text
+    # Connect timeout is confirmed pre-request failure: hold MUST be released
+    assert len(reservation_service.releases) == 1
+
+
+def test_stream_chat_retains_reservation_on_post_connection_read_timeout(monkeypatch) -> None:
+    """A post-connection read timeout must NOT release the reservation (retain for reconciliation)."""
+    read_error = ApiError(
+        504,
+        "agent_runtime_stream_read_timeout",
+        "The gateway timed out while reading stream data.",
+        {"timeout_type": "read", "reason": "read timed out"},
+    )
+    reservation_service = FakeWalletReservationService()
+
+    monkeypatch.setattr(routes_stream, "authenticate_request", _fake_authenticate_request)
+    _enable_streaming_route(monkeypatch)
+    monkeypatch.setattr(
+        routes_stream,
+        "get_streaming_chat_backend_client",
+        lambda _agent_config: _make_runtime_client(
+            stream_error=read_error,
+            fallback_error=RuntimeError("no fallback"),
+        )(),
+    )
+    monkeypatch.setattr(routes_stream, "get_pubsub_publisher", _fake_get_pubsub_publisher)
+    monkeypatch.setattr(
+        routes_stream,
+        "get_wallet_reservation_service",
+        _fake_get_wallet_reservation_service(reservation_service),
+    )
+    monkeypatch.setattr(
+        routes_stream,
+        "get_settings",
+        lambda: SimpleNamespace(
+            stream_debug=False,
+            upstream_connect_timeout_seconds=10,
+            upstream_read_timeout_seconds=240,
+        ),
+    )
+
+    response = client.post("/v1/agents/antigravity_agent/chat/stream", json={"message": "hello"})
+
+    assert response.status_code == 200
+    assert '"code": "agent_runtime_stream_read_timeout"' in response.text
+    # Read timeout is post-request-acceptance: hold must NOT be released, retained for reconciliation!
+    assert len(reservation_service.releases) == 0
+

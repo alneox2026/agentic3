@@ -843,3 +843,204 @@ def test_production_catalog_with_stripe_mode_test_accepts_test_events():
     result = service.handle_sync(raw_payload=b"test_payload", stripe_signature="signature")
     assert result.outcome == "ignored"
 
+
+def test_refund_created_full_combined_topup_caps_debit_at_credit_nanos():
+    """Full refund of $10 combined charge ($5 credit + $5 fee) debits only $5 credit, not raw $10."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_refund_combined_full",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_comb_full",
+                "charge": "ch_comb_full",
+                "amount": 1000,  # $10 refunded
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_comb_full",
+        "customer": "cus_test_123",
+        "amount": 1000,  # $10 total ($5 credit + $5 fee)
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "credit_5_usd",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"refund_comb_full_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_comb_full": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"refund_comb_full_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    # Debited exactly 5_000_000_000 (credit_5_usd), so balance is 0, NOT -5_000_000_000
+    assert wallet["available_credit_nanos"] == 0
+    assert wallet["status"] == "active"
+    tx = client.documents[("wallet_transactions", "stripe_refund_re_comb_full")]
+    assert tx["amount_nanos"] == -5_000_000_000
+    assert tx["stripe_amount_cents"] == -1000
+    assert tx["service_fee_reversed_cents"] == 500
+
+
+def test_refund_created_partial_combined_topup_suspends_and_flags_for_review():
+    """Partial refund of combined charge suspends wallet and flags for review without debiting arbitrary nanos."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_refund_combined_partial",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_comb_part",
+                "charge": "ch_comb_part",
+                "amount": 500,  # $5 partial refund on $10 charge
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_comb_part",
+        "customer": "cus_test_123",
+        "amount": 1000,  # $10 total
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "credit_5_usd",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"refund_comb_part_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_comb_part": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"refund_comb_part_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    # Balance must NOT be debited arbitrarily; wallet suspended and flagged for review
+    assert wallet["available_credit_nanos"] == 5_000_000_000
+    assert wallet["status"] == "suspended"
+    assert wallet["suspension_reason"] == "partial_combined_refund"
+    assert wallet["review_required"] is True
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["review_required"] is True
+    assert account["review_reason"] == "partial_combined_refund"
+
+
+def test_charge_dispute_created_does_not_overwrite_refund_debt_suspension():
+    """Dispute on a wallet already suspended for refund_debt preserves refund_debt as primary reason."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    dispute_event = {
+        "id": "evt_dispute_on_debt",
+        "type": "charge.dispute.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_test_debt",
+                "charge": "ch_debt_parent",
+                "status": "needs_response",
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_debt_parent",
+        "customer": "cus_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "suspended",
+        "suspension_reason": "refund_debt",
+        "suspension_reasons": ["refund_debt"],
+        "available_credit_nanos": -2_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"dispute_on_debt_payload": dispute_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_debt_parent": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"dispute_on_debt_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_disputed"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+    # Refuses to overwrite refund_debt
+    assert wallet["suspension_reason"] == "refund_debt"
+    assert "dispute" in wallet["suspension_reasons"]
+    assert "refund_debt" in wallet["suspension_reasons"]
+
+

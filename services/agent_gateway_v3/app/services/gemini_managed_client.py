@@ -300,6 +300,10 @@ class GeminiManagedClient:
             },
         }
 
+        if agent_config.max_output_tokens is not None:
+            payload["agent_config"]["max_output_tokens"] = agent_config.max_output_tokens
+            payload["generation_config"] = {"max_output_tokens": agent_config.max_output_tokens}
+
         # Thread continuation: preserve state, files, and workspace
         if previous_interaction_id:
             payload["previous_interaction_id"] = previous_interaction_id

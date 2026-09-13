@@ -7,6 +7,7 @@ from contextlib import suppress
 from datetime import datetime, timezone
 import logging
 
+import httpx
 from fastapi import APIRouter, Request
 
 from common.diagnostics import sanitize_for_diagnostics
@@ -26,6 +27,20 @@ from services.agent_gateway_v3.app.services.turn_event_builder import (
 from services.agent_gateway_v3.app.services.wallet_reservations import (
     get_wallet_reservation_service,
 )
+
+
+def _is_pre_request_failure(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    if isinstance(exc, ApiError):
+        details = exc.details or {}
+        if details.get("timeout_type") == "connect":
+            return True
+        if exc.code.endswith("_connect_timeout"):
+            return True
+        if exc.code.endswith("_unreachable"):
+            return True
+    return False
 
 
 LOGGER = logging.getLogger(__name__)
@@ -87,7 +102,7 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
             message=payload.message,
         )
     except ApiError as exc:
-        if billing_reservation:
+        if billing_reservation and _is_pre_request_failure(exc):
             with suppress(Exception):
                 await wallet_reservation_service.release(billing_reservation)
         backend_latency_ms = int(
@@ -111,8 +126,8 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
             error_details=sanitize_for_diagnostics(exc.details),
         )
         raise
-    except Exception:
-        if billing_reservation:
+    except Exception as exc:
+        if billing_reservation and _is_pre_request_failure(exc):
             with suppress(Exception):
                 await wallet_reservation_service.release(billing_reservation)
         raise
