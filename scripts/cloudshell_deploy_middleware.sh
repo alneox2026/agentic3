@@ -92,7 +92,8 @@ cat > terraform.auto.tfvars.json <<EOF
   "billing_api_stripe_webhook_signing_secret_version": "1",
   "billing_api_checkout_success_url": "https://ceoappdev.flutterflow.app/billing-complete?session_id={CHECKOUT_SESSION_ID}",
   "billing_api_checkout_cancel_url": "https://ceoappdev.flutterflow.app/billing-cancelled",
-  "billing_enforcement_enabled": true${EXTRA_TFVARS}
+  "billing_enforcement_enabled": true,
+  "billing_reconciliation_enabled": true${EXTRA_TFVARS}
 }
 EOF
 

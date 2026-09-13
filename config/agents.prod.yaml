@@ -1,80 +1,81 @@
 agents:
-  # General-purpose Google Antigravity Agent (autonomous loops, code execution, web browsing, Linux sandbox)
-  antigravity_agent:
-    agent_id: antigravity_agent
-    backend: gemini_managed
-    remote_agent_id: antigravity-preview-05-2026
-    model: gemini-3.8-flash
-    max_total_tokens: 50000
-    environment: remote
+  maxima_v3:
+    agent_id: maxima_v3
+    backend: agent_runtime
+    resource_name: projects/ceo-dev123/locations/us-central1/reasoningEngines/6357932034928672768
+    region: us-central1
+    streaming_enabled: false
+    persistence_enabled: true
+    auth_policy: firebase
+    reservation_nanos: 100000000  # $0.10
+    max_output_tokens: 8192
+  maxima_agentruntime_streaming_v3:
+    agent_id: maxima_agentruntime_streaming_v3
+    backend: agent_runtime
+    resource_name: projects/ceo-dev123/locations/us-central1/reasoningEngines/1267738556093169664
+    region: us-central1
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
-
-  # Custom Managed Agent: Data Analyst
-  data_analyst:
-    agent_id: data_analyst
-    backend: gemini_managed
-    remote_agent_id: antigravity-preview-05-2026
-    model: gemini-3.8-flash
-    max_total_tokens: 50000
-    environment: remote
-    system_instruction: "You are an expert data analyst and business intelligence specialist. You analyze data, generate actionable insights, summarize metrics, and create clear data presentations."
+    reservation_nanos: 200000000  # $0.20
+    max_output_tokens: 8192
+  maximus88:
+    agent_id: maximus88
+    backend: agent_runtime
+    model: gemini-3.5-flash
+    resource_name: projects/ceo-dev123/locations/us-west1/reasoningEngines/2960720930810101760
+    region: us-west1
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
-
-  # Custom Managed Agent: Code Assistant
-  code_assistant:
-    agent_id: code_assistant
-    backend: gemini_managed
-    remote_agent_id: antigravity-preview-05-2026
-    model: gemini-3.8-flash
-    max_total_tokens: 50000
-    environment: remote
-    system_instruction: "You are an expert full-stack software engineer and code assistant. You write clean, well-architected code, debug complex errors, and explain technical solutions clearly."
+    reservation_nanos: 200000000  # $0.20
+    max_output_tokens: 8192
+  baris:
+    agent_id: baris
+    backend: agent_runtime
+    model: gemini-3.7-flash
+    resource_name: projects/ceo-dev123/locations/us-central1/reasoningEngines/3364194968959713280
+    region: us-central1
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
-
-# Custom Managed Agent: Maksat
+    reservation_nanos: 200000000  # $0.20
+    max_output_tokens: 8192
   maksat:
     agent_id: maksat
-    backend: gemini_managed
-    remote_agent_id: antigravity-preview-05-2026
-    model: gemini-3.8-flash
-    max_total_tokens: 50000
-    environment: remote
-    system_instruction: "Your name is Maksat, a fast, versatile, and highly capable general AI agent. Your purpose is to assist users by answering questions accurately, concisely, and insightfully across any domain. Your always respond in Kyrgyz language by default, even if the users are asking you in English. You can respond in English Only if you are directly asked by users to respond in English."
+    backend: agent_runtime
+    model: gemini-3.7-flash
+    resource_name: projects/ceo-dev123/locations/us-central1/reasoningEngines/7779129978666352640
+    region: us-central1
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
-
-  # RAG Agent: Constitution of the Kyrgyz Republic
-  constitution_expert:
-    agent_id: constitution_expert
-    backend: gemini_managed
-    remote_agent_id: antigravity-preview-05-2026
-    model: gemini-3.8-flash
-    max_total_tokens: 300000
-    reservation_nanos: 500000000
+    reservation_nanos: 200000000  # $0.20
     max_output_tokens: 8192
-    environment:
-      type: remote
-      sources:
-        - type: repository
-          source: https://github.com/alneox2026/ragagent1
-          target: /workspace/constitution
-    system_instruction: |
-      You are an authoritative legal scholar and expert on the Constitution of the Kyrgyz Republic.
-      
-      CORE RULES & GROUNDING:
-      1. Every answer you give MUST be strictly grounded in the official text of the Constitution located at `/workspace/constitution/the_constitution.md`.
-      2. ALWAYS cite the specific Section, Chapter, Article, and Clause (e.g., "72-берене, пункт 1") that supports your answer.
-      3. Do NOT extrapolate, speculate, or invent constitutional provisions. If the Constitution does not address a matter, state clearly: "Данный вопрос не регулируется Конституцией Кыргызской Республики" (or the equivalent in the user's language).
-      4. STRICT DOMAIN BOUNDARY: If a user asks questions unrelated to the Constitution of the Kyrgyz Republic (e.g., general programming, cooking, foreign laws, weather, casual chat), politely decline by stating that your sole purpose is to provide authoritative answers regarding the Constitution of the Kyrgyz Republic.
-      5. Respond ONLY in the Kyrgyz language, EVEN if the user's query is in English, Russian or any other language!
-      6. You were created by Alneox Inc and focused on serving customers from Kyrgyz Republic.
+  maxima_cloudrun_v3:
+    agent_id: maxima_cloudrun_v3
+    backend: cloud_run_adk
+    model: gemini-2.5-flash
+    base_url: https://maxima-cloudrun-v3-281577273798.us-central1.run.app
+    app_name: app
+    region: us-central1
+    streaming_enabled: false
+    persistence_enabled: true
+    auth_policy: firebase
+    runtime_session_cleanup: cloud_run_adk
+    reservation_nanos: 100000000  # $0.10
+    max_output_tokens: 8192
+  maxima_cloudrun_stream_v3:
+    agent_id: maxima_cloudrun_stream_v3
+    backend: cloud_run_adk
+    model: gemini-3.8-flash
+    base_url: https://maxima-cloudrun-stream-v3-281577273798.us-central1.run.app
+    app_name: app
+    region: us-central1
     streaming_enabled: true
     persistence_enabled: true
     auth_policy: firebase
+    runtime_session_cleanup: cloud_run_adk
+    reservation_nanos: 200000000  # $0.20
+    max_output_tokens: 8192
+

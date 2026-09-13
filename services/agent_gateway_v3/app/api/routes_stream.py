@@ -503,7 +503,12 @@ async def stream_chat(
                 outcome="api_error",
             )
             if billing_reservation:
-                if diagnostics.normalized_token_event_count == 0:
+                # Release the hold only if the upstream call never began
+                # (no SSE messages received). Once the upstream accepted
+                # the request, the model may have incurred cost even
+                # without emitting text tokens (e.g. safety blocks,
+                # timeouts after model execution).
+                if diagnostics.upstream_sse_message_count == 0:
                     with suppress(Exception):
                         await wallet_reservation_service.release(billing_reservation)
                 else:
@@ -532,7 +537,7 @@ async def stream_chat(
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             if billing_reservation:
-                if diagnostics.normalized_token_event_count == 0:
+                if diagnostics.upstream_sse_message_count == 0:
                     with suppress(Exception):
                         await wallet_reservation_service.release(billing_reservation)
                 else:

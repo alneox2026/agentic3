@@ -199,9 +199,20 @@ class StripeWebhookService:
                 stripe_livemode=stripe_livemode,
                 payload_sha256=payload_hash,
             )
-        if event_type in {"charge.refunded", "refund.created"}:
-            return self._handle_charge_refunded(
+        if event_type == "refund.created":
+            return self._handle_refund_created(
                 event=event,
+                stripe_event_id=event_id,
+                stripe_event_type=event_type,
+                stripe_event_created_at=event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_hash,
+            )
+        if event_type == "charge.refunded":
+            # Reconciliation-only: charge.refunded reports cumulative
+            # amount_refunded which would cause double-debit if both
+            # refund.created and charge.refunded are processed.
+            return self._record_ignored_event(
                 stripe_event_id=event_id,
                 stripe_event_type=event_type,
                 stripe_event_created_at=event_created_at,
@@ -896,7 +907,7 @@ class StripeWebhookService:
 
         return self._transaction_runner(client, operation)
 
-    def _handle_charge_refunded(
+    def _handle_refund_created(
         self,
         *,
         event: Mapping[str, Any],
@@ -906,29 +917,20 @@ class StripeWebhookService:
         stripe_livemode: bool,
         payload_sha256: str,
     ) -> WebhookResult:
-        refund_or_charge = _event_object(event)
-        if stripe_event_type == "refund.created":
-            refund_id = _required_id(refund_or_charge.get("id"), "Refund id")
-            charge_id = _optional_id(refund_or_charge.get("charge")) or ""
-            charge: Mapping[str, Any] = {}
-            if charge_id:
-                try:
-                    charge = self._stripe_gateway.retrieve_charge(charge_id)
-                except Exception:
-                    charge = {}
-            metadata = charge.get("metadata") or refund_or_charge.get("metadata") or {}
-            customer_id = _optional_id(charge.get("customer")) or _optional_id(refund_or_charge.get("customer"))
-            amount_refunded_cents = refund_or_charge.get("amount") or 0
-            amount_cents = charge.get("amount") or amount_refunded_cents
-            transaction_id = f"stripe_refund_{refund_id}"
-        else:
-            charge = refund_or_charge
-            charge_id = _required_id(charge.get("id"), "Charge id")
-            metadata = charge.get("metadata") or {}
-            customer_id = _optional_id(charge.get("customer"))
-            amount_cents = charge.get("amount") or 0
-            amount_refunded_cents = charge.get("amount_refunded") or amount_cents
-            transaction_id = f"stripe_refund_{charge_id}_{stripe_event_id}"
+        refund_obj = _event_object(event)
+        refund_id = _required_id(refund_obj.get("id"), "Refund id")
+        charge_id = _optional_id(refund_obj.get("charge")) or ""
+        # retrieve_charge must succeed so we can locate the billing account;
+        # if Stripe is temporarily unavailable let the error propagate as 5xx
+        # so Stripe retries the webhook delivery.
+        charge: Mapping[str, Any] = {}
+        if charge_id:
+            charge = self._stripe_gateway.retrieve_charge(charge_id)
+        metadata = charge.get("metadata") or refund_obj.get("metadata") or {}
+        customer_id = _optional_id(charge.get("customer")) or _optional_id(refund_obj.get("customer"))
+        amount_refunded_cents = refund_obj.get("amount") or 0
+        amount_cents = charge.get("amount") or amount_refunded_cents
+        transaction_id = f"stripe_refund_{refund_id}"
 
         billing_account_id = _optional_id(metadata.get("billing_account_id"))
         if not billing_account_id:
@@ -942,8 +944,15 @@ class StripeWebhookService:
         if metadata.get("catalog_environment") != self._catalog.environment:
             raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
 
+        # For combined charges (subscription + top-up), a partial refund
+        # cannot reliably determine which portion is credit vs. service fee.
+        # Only prorate when the charge has a topup_package_id and no
+        # subscription line item bundled.
+        checkout_kind = metadata.get("checkout_kind", "")
+        is_combined_charge = checkout_kind == "initial_subscription_topup"
         topup_package_id = _optional_id(metadata.get("topup_package_id"))
-        if topup_package_id:
+
+        if topup_package_id and not is_combined_charge:
             try:
                 package = self._catalog.get_topup_package(topup_package_id)
                 if amount_cents > 0 and amount_refunded_cents < amount_cents:
@@ -953,6 +962,7 @@ class StripeWebhookService:
             except Exception:
                 reversed_nanos = amount_refunded_cents * 10_000_000
         else:
+            # For combined or fee-only charges, use the raw cent amount.
             reversed_nanos = amount_refunded_cents * 10_000_000
 
         client = self._firestore_client_factory()
@@ -1017,6 +1027,7 @@ class StripeWebhookService:
                 }
                 if new_available < 0:
                     wallet_updates["status"] = "suspended"
+                    wallet_updates["suspension_reason"] = "refund_debt"
                 transaction.update(wallet_ref, wallet_updates)
 
             transaction.create(
@@ -1078,11 +1089,10 @@ class StripeWebhookService:
         charge_id = _optional_id(dispute_or_charge.get("charge")) or _required_id(dispute_or_charge.get("id"), "Charge/Dispute id")
         metadata = dispute_or_charge.get("metadata") or {}
         if not metadata.get("billing_account_id") and dispute_or_charge.get("charge"):
-            try:
-                parent_charge = self._stripe_gateway.retrieve_charge(dispute_or_charge["charge"])
-                metadata = parent_charge.get("metadata") or {}
-            except Exception:
-                pass
+            # retrieve_charge must succeed so we can locate the billing account;
+            # let failures propagate as 5xx so Stripe retries the webhook.
+            parent_charge = self._stripe_gateway.retrieve_charge(dispute_or_charge["charge"])
+            metadata = parent_charge.get("metadata") or {}
         billing_account_id = _optional_id(metadata.get("billing_account_id"))
         if not billing_account_id:
             return self._record_ignored_event(
@@ -1143,6 +1153,7 @@ class StripeWebhookService:
                     wallet_ref,
                     {
                         "status": "suspended",
+                        "suspension_reason": "dispute",
                         "updated_at": processed_at,
                         "last_dispute_at": processed_at,
                     },
@@ -1204,11 +1215,10 @@ class StripeWebhookService:
         charge_id = _optional_id(dispute_obj.get("charge"))
         metadata = dispute_obj.get("metadata") or {}
         if not metadata.get("billing_account_id") and charge_id:
-            try:
-                parent_charge = self._stripe_gateway.retrieve_charge(charge_id)
-                metadata = parent_charge.get("metadata") or {}
-            except Exception:
-                pass
+            # retrieve_charge must succeed; let failures propagate as 5xx
+            # so Stripe retries the webhook delivery.
+            parent_charge = self._stripe_gateway.retrieve_charge(charge_id)
+            metadata = parent_charge.get("metadata") or {}
         billing_account_id = _optional_id(metadata.get("billing_account_id"))
         if not billing_account_id:
             return self._record_ignored_event(
@@ -1254,11 +1264,18 @@ class StripeWebhookService:
 
             if status == "won" and wallet_snapshot.exists:
                 wallet = wallet_snapshot.to_dict() or {}
-                if wallet.get("status") == "suspended":
+                # Only reinstate if the wallet was suspended specifically
+                # for a dispute; other suspension reasons (refund_debt,
+                # manual, etc.) must be resolved separately.
+                if (
+                    wallet.get("status") == "suspended"
+                    and wallet.get("suspension_reason") == "dispute"
+                ):
                     transaction.update(
                         wallet_ref,
                         {
                             "status": "active",
+                            "suspension_reason": None,
                             "updated_at": processed_at,
                             "dispute_reinstated_at": processed_at,
                         },

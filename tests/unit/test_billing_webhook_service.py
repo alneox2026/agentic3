@@ -369,7 +369,8 @@ def test_subsequent_topup_credits_existing_wallet_successfully():
     assert wallet["lifetime_credited_nanos"] == 15_000_000_000
 
 
-def test_charge_refunded_claws_back_credit_and_suspends_if_negative():
+def test_charge_refunded_is_reconciliation_only_and_does_not_change_balance():
+    """charge.refunded is now reconciliation-only; it must NOT debit the wallet."""
     now = datetime(2026, 8, 12, tzinfo=timezone.utc)
     account_id = customer_billing_account_document_id("user-1")
     wallet_id = customer_wallet_document_id("user-1")
@@ -417,11 +418,12 @@ def test_charge_refunded_claws_back_credit_and_suspends_if_negative():
 
     result = service.handle_sync(raw_payload=b"refund_payload", stripe_signature="signature")
 
-    assert result.outcome == "charge_refunded"
+    assert result.outcome == "ignored"
     assert result.duplicate is False
+    # Wallet balance must NOT have changed
     wallet = client.documents[("customer_wallets", wallet_id)]
-    assert wallet["available_credit_nanos"] == -5_000_000_000
-    assert wallet["status"] == "suspended"
+    assert wallet["available_credit_nanos"] == 5_000_000_000
+    assert wallet["status"] == "active"
 
 
 def test_charge_dispute_created_suspends_wallet():
@@ -473,6 +475,7 @@ def test_charge_dispute_created_suspends_wallet():
     assert result.duplicate is False
     wallet = client.documents[("customer_wallets", wallet_id)]
     assert wallet["status"] == "suspended"
+    assert wallet["suspension_reason"] == "dispute"
 
 
 def test_refund_created_processes_individual_amount_and_keys_on_refund_id():
@@ -536,6 +539,96 @@ def test_refund_created_processes_individual_amount_and_keys_on_refund_id():
     assert ("wallet_transactions", "stripe_refund_re_test_part1") in client.documents
 
 
+def test_refund_created_suspends_wallet_with_reason_on_negative_balance():
+    """refund.created should set suspension_reason='refund_debt' when balance goes negative."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_refund_neg",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_full_refund",
+                "charge": "ch_test_full",
+                "amount": 1000,
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_test_full",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "topup_package_id": "credit_10_usd",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 2_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 8_000_000_000,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"refund_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_test_full": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"refund_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+    assert wallet["suspension_reason"] == "refund_debt"
+
+
+def test_refund_created_retrieve_charge_failure_propagates_as_error():
+    """If retrieve_charge() fails, the error must propagate (5xx) so Stripe retries."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    refund_event = {
+        "id": "evt_refund_err",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_test_err",
+                "charge": "ch_missing",
+                "amount": 500,
+            }
+        },
+    }
+    client = FakeFirestore()
+    stripe = FakeStripeGateway(
+        events={b"refund_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={},  # ch_missing not in the dict => KeyError
+    )
+    service = _service(client, stripe, now)
+
+    with pytest.raises(KeyError):
+        service.handle_sync(raw_payload=b"refund_payload", stripe_signature="signature")
+
+
 def test_charge_dispute_retrieves_charge_metadata_when_dispute_metadata_empty():
     now = datetime(2026, 8, 12, tzinfo=timezone.utc)
     account_id = customer_billing_account_document_id("user-1")
@@ -591,6 +684,7 @@ def test_charge_dispute_retrieves_charge_metadata_when_dispute_metadata_empty():
     assert result.outcome == "charge_disputed"
     wallet = client.documents[("customer_wallets", wallet_id)]
     assert wallet["status"] == "suspended"
+    assert wallet["suspension_reason"] == "dispute"
 
 
 def test_charge_dispute_closed_won_reinstates_wallet():
@@ -628,6 +722,7 @@ def test_charge_dispute_closed_won_reinstates_wallet():
         "owner_uid": "user-1",
         "currency": "USD",
         "status": "suspended",
+        "suspension_reason": "dispute",
         "available_credit_nanos": 10_000_000_000,
         "reserved_credit_nanos": 0,
         "settled_usage_nanos": 0,
@@ -649,6 +744,69 @@ def test_charge_dispute_closed_won_reinstates_wallet():
     assert result.outcome == "dispute_resolved"
     wallet = client.documents[("customer_wallets", wallet_id)]
     assert wallet["status"] == "active"
+    assert wallet.get("suspension_reason") is None
+
+
+def test_charge_dispute_closed_won_does_not_reinstate_refund_debt_suspended_wallet():
+    """A dispute-won must NOT reinstate a wallet suspended for refund_debt."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    dispute_event = {
+        "id": "evt_dispute_closed_no_reinstate",
+        "type": "charge.dispute.closed",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_test_no_reinstate",
+                "charge": "ch_parent_no_reinstate",
+                "status": "won",
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_parent_no_reinstate",
+        "customer": "cus_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "suspended",
+        "suspension_reason": "refund_debt",
+        "available_credit_nanos": -2_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"dispute_won_payload": dispute_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_parent_no_reinstate": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"dispute_won_payload", stripe_signature="signature")
+
+    assert result.outcome == "dispute_resolved"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    # Must remain suspended — the suspension was for refund_debt, not dispute
+    assert wallet["status"] == "suspended"
+    assert wallet["suspension_reason"] == "refund_debt"
 
 
 def test_production_catalog_with_stripe_mode_test_accepts_test_events():
