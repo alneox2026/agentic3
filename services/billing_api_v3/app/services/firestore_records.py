@@ -16,6 +16,8 @@ _WEBHOOK_OUTCOMES = frozenset(
         "topup_credited",
         "service_fee_collected",
         "subscription_state_updated",
+        "charge_refunded",
+        "charge_disputed",
     }
 )
 

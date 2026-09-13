@@ -14,31 +14,31 @@ cd "${ROOT_DIR}"
 
 # Auto-detect latest built digests or tags per service if not explicitly provided
 if [ -n "${TAG:-}" ] && [ "${TAG}" != "latest" ]; then
-  GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:${TAG}"
-  WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:${TAG}"
-  BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:${TAG}"
+  GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:${TAG}"
+  WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:${TAG}"
+  BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:${TAG}"
 else
   echo "--> Resolving :latest image digests from Artifact Registry..."
-  GATEWAY_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
-  WORKER_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
-  BILLING_API_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  GATEWAY_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  WORKER_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  BILLING_API_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
 
   if [ -n "${GATEWAY_DIGEST}" ]; then
-    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway@${GATEWAY_DIGEST}"
+    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway@${GATEWAY_DIGEST}"
   else
-    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:latest"
+    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:latest"
   fi
 
   if [ -n "${WORKER_DIGEST}" ]; then
-    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker@${WORKER_DIGEST}"
+    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker@${WORKER_DIGEST}"
   else
-    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:latest"
+    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:latest"
   fi
 
   if [ -n "${BILLING_API_DIGEST}" ]; then
-    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api@${BILLING_API_DIGEST}"
+    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api@${BILLING_API_DIGEST}"
   else
-    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:latest"
+    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:latest"
   fi
 fi
 # Auto-detect cluster suffix from the repo directory name (e.g. ceodev-v6 → v6)
@@ -47,7 +47,7 @@ if [ -z "${CLUSTER_SUFFIX:-}" ]; then
   REPO_DIR_NAME="$(basename "${ROOT_DIR}")"
   CLUSTER_SUFFIX="${REPO_DIR_NAME##*-}"  # extracts "v6" from "ceodev-v6"
 fi
-TF_STATE_PREFIX="${TF_STATE_PREFIX:-managed-agents-${CLUSTER_SUFFIX}/middleware}"
+TF_STATE_PREFIX="${TF_STATE_PREFIX:-ceodev-${CLUSTER_SUFFIX}/middleware}"
 
 echo "================================================================="
 echo " Deploying Middleware Infrastructure (Terraform)"
@@ -95,11 +95,7 @@ cat > terraform.auto.tfvars.json <<EOF
 }
 EOF
 
-if ! terraform apply -auto-approve; then
-  echo "--> Initial apply hit a transient dependency or GCP indexing delay (e.g. logging metrics). Retrying in 20 seconds..."
-  sleep 20
-  terraform apply -auto-approve
-fi
+terraform apply -auto-approve
 
 echo "================================================================="
 echo " Middleware Deployed Successfully!"

@@ -161,7 +161,7 @@ def _elapsed_ms(started_at: datetime) -> int:
 def _safe_log_reason(details: dict | None) -> str | None:
     if not isinstance(details, dict):
         return None
-    reason = details.get("reason") or details.get("detail")
+    reason = details.get("reason")
     if reason is None:
         return None
     return str(reason)[:MAX_LOG_REASON_LENGTH]
@@ -269,6 +269,7 @@ async def stream_chat(
         agent_id=agent_config.agent_id,
         request_id=request_context.request_id,
         turn_id=request_context.turn_id,
+        reservation_nanos=agent_config.reservation_nanos,
     )
     billing_metadata = (
         billing_reservation.event_metadata() if billing_reservation else None
@@ -488,7 +489,7 @@ async def stream_chat(
                 upstream_first_event_latency_ms=diagnostics.upstream_first_event_latency_ms,
                 first_token_latency_ms=diagnostics.first_token_latency_ms,
                 upstream_sse_message_count=diagnostics.upstream_sse_message_count,
-                reason=_safe_log_reason(exc.details) or (str(exc.message)[:MAX_LOG_REASON_LENGTH] if getattr(exc, "message", None) else None),
+                reason=_safe_log_reason(exc.details),
             )
             _emit_stream_debug_log(
                 enabled=settings.stream_debug,
@@ -500,6 +501,9 @@ async def stream_chat(
                 diagnostics=diagnostics,
                 outcome="api_error",
             )
+            if billing_reservation:
+                with suppress(Exception):
+                    await wallet_reservation_service.release(billing_reservation)
             yield build_error_event(exc.code, exc.message, exc.details)
             yield build_done_event(
                 {
@@ -512,6 +516,9 @@ async def stream_chat(
                 }
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
+            if billing_reservation:
+                with suppress(Exception):
+                    await wallet_reservation_service.release(billing_reservation)
             log_structured(
                 LOGGER,
                 logging.ERROR,

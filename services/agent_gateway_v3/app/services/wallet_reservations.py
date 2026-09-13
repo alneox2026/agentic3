@@ -37,7 +37,7 @@ class WalletReservation:
         }
 
 
-TransactionRunner = Callable[[Any, Callable[[Any], WalletReservation]], WalletReservation]
+TransactionRunner = Callable[[Any, Callable[[Any], Any]], Any]
 
 
 class WalletReservationService:
@@ -60,6 +60,7 @@ class WalletReservationService:
         agent_id: str,
         request_id: str,
         turn_id: str,
+        reservation_nanos: int | None = None,
     ) -> WalletReservation | None:
         """Reserve credit, or return ``None`` while enforcement is disabled."""
 
@@ -71,6 +72,7 @@ class WalletReservationService:
             agent_id=agent_id,
             request_id=request_id,
             turn_id=turn_id,
+            reservation_nanos=reservation_nanos,
         )
 
     def _reserve_sync(
@@ -80,11 +82,16 @@ class WalletReservationService:
         agent_id: str,
         request_id: str,
         turn_id: str,
+        reservation_nanos: int | None = None,
     ) -> WalletReservation:
         billing_subject_id = user_id
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=self._settings.billing_reservation_ttl_seconds)
-        reserved_amount_nanos = self._settings.billing_reservation_nanos
+        reserved_amount_nanos = (
+            reservation_nanos
+            if reservation_nanos is not None and reservation_nanos > 0
+            else self._settings.billing_reservation_nanos
+        )
         if reserved_amount_nanos <= 0:
             raise RuntimeError("BILLING_RESERVATION_NANOS must be greater than zero.")
         if self._settings.billing_reservation_ttl_seconds <= 0:
@@ -200,6 +207,80 @@ class WalletReservationService:
 
         return self._transaction_runner(client, operation)
 
+    async def release(
+        self,
+        reservation: WalletReservation | None,
+    ) -> None:
+        """Release an uncommitted reservation back to available credit immediately."""
+        if reservation is None or not self._settings.billing_enforcement_enabled:
+            return
+        await asyncio.to_thread(
+            self._release_sync,
+            reservation=reservation,
+        )
+
+    def _release_sync(
+        self,
+        *,
+        reservation: WalletReservation,
+    ) -> None:
+        client = self._firestore_client_factory()
+        now = datetime.now(timezone.utc)
+        wallet_ref = client.collection(self._settings.wallets_collection).document(
+            customer_wallet_document_id(reservation.billing_subject_id)
+        )
+        reservation_ref = client.collection(
+            self._settings.billing_reservations_collection
+        ).document(reservation.reservation_id)
+
+        def operation(transaction: Any) -> None:
+            reservation_snapshot = get_transaction_document_snapshot(transaction, reservation_ref)
+            if not reservation_snapshot.exists:
+                return
+            res_dict = reservation_snapshot.to_dict() or {}
+            if res_dict.get("status") != "reserved":
+                return
+
+            reserved_amount = nonnegative_int(
+                res_dict.get("reserved_amount_nanos", reservation.reserved_amount_nanos),
+                field_name="reserved_amount_nanos",
+            )
+
+            wallet_snapshot = get_transaction_document_snapshot(transaction, wallet_ref)
+            if wallet_snapshot.exists:
+                wallet = wallet_snapshot.to_dict() or {}
+                available = nonnegative_int(
+                    wallet.get("available_credit_nanos", 0),
+                    field_name="available_credit_nanos",
+                )
+                reserved = nonnegative_int(
+                    wallet.get("reserved_credit_nanos", 0),
+                    field_name="reserved_credit_nanos",
+                )
+                new_reserved = max(0, reserved - reserved_amount)
+                new_available = available + reserved_amount
+
+                transaction.update(
+                    wallet_ref,
+                    {
+                        "available_credit_nanos": new_available,
+                        "reserved_credit_nanos": new_reserved,
+                        "updated_at": now,
+                    },
+                )
+
+            transaction.update(
+                reservation_ref,
+                {
+                    "status": "released",
+                    "released_amount_nanos": reserved_amount,
+                    "updated_at": now,
+                    "released_at": now,
+                },
+            )
+
+        self._transaction_runner(client, operation)
+
     @staticmethod
     def _existing_reservation(
         reservation: dict[str, Any],
@@ -254,8 +335,8 @@ class WalletReservationService:
 
 def _run_firestore_transaction(
     client: Any,
-    operation: Callable[[Any], WalletReservation],
-) -> WalletReservation:
+    operation: Callable[[Any], Any],
+) -> Any:
     """Run a Firestore transaction with retry-on-contention semantics."""
 
     from google.cloud import firestore
@@ -263,7 +344,7 @@ def _run_firestore_transaction(
     transaction = client.transaction()
 
     @firestore.transactional
-    def run(transaction: Any) -> WalletReservation:
+    def run(transaction: Any) -> Any:
         return operation(transaction)
 
     return run(transaction)

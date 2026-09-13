@@ -54,3 +54,35 @@ def test_catalog_rejects_an_unknown_topup_package() -> None:
 
     with pytest.raises(BillingCatalogError, match="Unknown top-up package"):
         catalog.get_topup_package("client_selected_price")
+
+
+def test_production_catalog_loads_successfully() -> None:
+    prod_catalog = load_billing_catalog(Path("config/billing.prod.yaml"))
+    assert prod_catalog.environment == "production"
+    assert prod_catalog.currency == "USD"
+
+
+def test_environment_prod_normalizes_to_production(tmp_path) -> None:
+    catalog_file = tmp_path / "billing.prod_alias.yaml"
+    catalog_file.write_text(
+        """
+schema_version: 1
+environment: prod
+currency: USD
+topup_packages:
+  credit_5_usd:
+    display_name: $5 token credit
+    stripe_price_id: price_1U3ZHnB5Es3VU3maoEQbMKnC
+    amount_cents: 500
+    credit_nanos: 5000000000
+monthly_service_fee:
+  stripe_price_id: price_1U3ZYBB5Es3VU3maSP6qq6sg
+  amount_cents: 500
+  fee_nanos: 5000000000
+  interval: month
+""".strip(),
+        encoding="utf-8",
+    )
+    catalog = load_billing_catalog(catalog_file)
+    assert catalog.environment == "production"
+

@@ -108,7 +108,9 @@ def load_billing_catalog(path: Path) -> BillingCatalog:
     if schema_version != 1:
         raise BillingCatalogError("Unsupported billing catalog schema_version.")
 
-    environment = _required_string(catalog.get("environment"), field_name="environment")
+    environment = _required_string(catalog.get("environment"), field_name="environment").strip().lower()
+    if environment == "prod":
+        environment = "production"
     if environment not in {"test", "production"}:
         raise BillingCatalogError("environment must be test or production.")
 

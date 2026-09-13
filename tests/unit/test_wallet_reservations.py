@@ -165,3 +165,68 @@ def test_reserve_rejects_insufficient_credit_before_model_execution(monkeypatch)
     assert wallet["available_credit_nanos"] == 499_999_999
     assert wallet["reserved_credit_nanos"] == 0
 
+
+def test_reserve_with_custom_reservation_nanos(monkeypatch):
+    _enable_billing(monkeypatch)
+    settings = get_settings()
+    client = FakeClient()
+    user_id = "user-1"
+    wallet_id = customer_wallet_document_id(user_id)
+    client.documents[(settings.wallets_collection, wallet_id)] = _wallet(user_id, available_credit_nanos=1_000_000_000)
+    service = WalletReservationService(
+        firestore_client_factory=lambda: client,
+        transaction_runner=_run_transaction,
+    )
+
+    reservation = asyncio.run(
+        service.reserve(
+            user_id=user_id,
+            agent_id="heavy-agent",
+            request_id="req-1",
+            turn_id="turn-custom",
+            reservation_nanos=200_000_000,
+        )
+    )
+
+    assert reservation is not None
+    assert reservation.reserved_amount_nanos == 200_000_000
+    wallet = client.documents[(settings.wallets_collection, wallet_id)]
+    assert wallet["available_credit_nanos"] == 800_000_000
+    assert wallet["reserved_credit_nanos"] == 200_000_000
+
+
+def test_release_restores_credit_immediately(monkeypatch):
+    _enable_billing(monkeypatch)
+    settings = get_settings()
+    client = FakeClient()
+    user_id = "user-1"
+    wallet_id = customer_wallet_document_id(user_id)
+    client.documents[(settings.wallets_collection, wallet_id)] = _wallet(user_id, available_credit_nanos=1_000_000_000)
+    service = WalletReservationService(
+        firestore_client_factory=lambda: client,
+        transaction_runner=_run_transaction,
+    )
+
+    reservation = asyncio.run(
+        service.reserve(
+            user_id=user_id,
+            agent_id="maxima",
+            request_id="req-1",
+            turn_id="turn-1",
+        )
+    )
+    assert reservation is not None
+    wallet = client.documents[(settings.wallets_collection, wallet_id)]
+    assert wallet["available_credit_nanos"] == 500_000_000
+    assert wallet["reserved_credit_nanos"] == 500_000_000
+
+    # Now release on failure
+    asyncio.run(service.release(reservation))
+
+    wallet = client.documents[(settings.wallets_collection, wallet_id)]
+    assert wallet["available_credit_nanos"] == 1_000_000_000
+    assert wallet["reserved_credit_nanos"] == 0
+    res_doc = client.documents[(settings.billing_reservations_collection, "turn-1")]
+    assert res_doc["status"] == "released"
+    assert res_doc["released_amount_nanos"] == 500_000_000
+

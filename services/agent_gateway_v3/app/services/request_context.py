@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import uuid
 
-from common.ids import new_turn_id
+from common.ids import deterministic_turn_id, new_turn_id
 
 
 @dataclass(frozen=True)
@@ -18,8 +18,10 @@ class RequestContext:
 
 
 def build_request_context(agent_id: str, client_turn_id: str | None = None) -> RequestContext:
-    # Client turn ids are correlation metadata only; persisted document ids stay server-owned.
-    turn_id = new_turn_id()
+    if client_turn_id and client_turn_id.strip():
+        turn_id = deterministic_turn_id(agent_id, client_turn_id.strip())
+    else:
+        turn_id = new_turn_id()
     return RequestContext(
         request_id=f"req-{uuid.uuid4().hex}",
         turn_id=turn_id,

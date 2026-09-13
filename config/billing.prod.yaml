@@ -1,5 +1,5 @@
 schema_version: 1
-environment: prod
+environment: production
 currency: USD
 
 topup_packages:

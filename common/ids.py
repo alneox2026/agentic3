@@ -17,6 +17,10 @@ def new_turn_id() -> str:
     return f"turn-{uuid.uuid4().hex}"
 
 
+def deterministic_turn_id(agent_id: str, client_turn_id: str) -> str:
+    return f"turn-{uuid.uuid5(uuid.NAMESPACE_DNS, f'{agent_id}:{client_turn_id}').hex}"
+
+
 def new_event_id() -> str:
     return f"evt-{uuid.uuid4().hex}"
 

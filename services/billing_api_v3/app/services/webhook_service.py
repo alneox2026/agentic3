@@ -199,6 +199,24 @@ class StripeWebhookService:
                 stripe_livemode=stripe_livemode,
                 payload_sha256=payload_hash,
             )
+        if event_type == "charge.refunded":
+            return self._handle_charge_refunded(
+                event=event,
+                stripe_event_id=event_id,
+                stripe_event_type=event_type,
+                stripe_event_created_at=event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_hash,
+            )
+        if event_type == "charge.dispute.created":
+            return self._handle_charge_dispute_created(
+                event=event,
+                stripe_event_id=event_id,
+                stripe_event_type=event_type,
+                stripe_event_created_at=event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_hash,
+            )
         return self._record_ignored_event(
             stripe_event_id=event_id,
             stripe_event_type=event_type,
@@ -864,6 +882,275 @@ class StripeWebhookService:
                 stripe_event_id=stripe_event_id,
                 stripe_event_type=stripe_event_type,
                 outcome="subscription_state_updated",
+                duplicate=False,
+            )
+
+        return self._transaction_runner(client, operation)
+
+    def _handle_charge_refunded(
+        self,
+        *,
+        event: Mapping[str, Any],
+        stripe_event_id: str,
+        stripe_event_type: str,
+        stripe_event_created_at: datetime,
+        stripe_livemode: bool,
+        payload_sha256: str,
+    ) -> WebhookResult:
+        charge = _event_object(event)
+        charge_id = _required_id(charge.get("id"), "Charge id")
+        metadata = charge.get("metadata") or {}
+        billing_account_id = _optional_id(metadata.get("billing_account_id"))
+        if not billing_account_id:
+            return self._record_ignored_event(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                stripe_event_created_at=stripe_event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_sha256,
+            )
+        if metadata.get("catalog_environment") != self._catalog.environment:
+            raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
+
+        amount_cents = charge.get("amount") or 0
+        amount_refunded_cents = charge.get("amount_refunded") or amount_cents
+        topup_package_id = _optional_id(metadata.get("topup_package_id"))
+        if topup_package_id:
+            try:
+                package = self._catalog.get_topup_package(topup_package_id)
+                if amount_cents > 0 and amount_refunded_cents < amount_cents:
+                    reversed_nanos = int(package.credit_nanos * (amount_refunded_cents / amount_cents))
+                else:
+                    reversed_nanos = package.credit_nanos
+            except Exception:
+                reversed_nanos = amount_refunded_cents * 10_000_000
+        else:
+            reversed_nanos = amount_refunded_cents * 10_000_000
+
+        client = self._firestore_client_factory()
+        account_ref = client.collection(self._settings.billing_accounts_collection).document(
+            billing_account_id
+        )
+        event_ref = client.collection(self._settings.stripe_webhook_events_collection).document(
+            stripe_webhook_event_document_id(stripe_event_id)
+        )
+        transaction_id = f"stripe_refund_{charge_id}_{stripe_event_id}"
+        transaction_ref = client.collection(self._settings.wallet_transactions_collection).document(
+            transaction_id
+        )
+        processed_at = _as_utc(self._now_factory())
+
+        def operation(transaction: Any) -> WebhookResult:
+            event_snapshot = get_transaction_document_snapshot(transaction, event_ref)
+            account_snapshot = get_transaction_document_snapshot(transaction, account_ref)
+            transaction_snapshot = get_transaction_document_snapshot(transaction, transaction_ref)
+
+            if event_snapshot.exists:
+                return WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
+                    duplicate=True,
+                )
+            if not account_snapshot.exists:
+                raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
+
+            account = account_snapshot.to_dict() or {}
+            owner_uid = self._validate_account_for_stripe(
+                account,
+                billing_account_id=billing_account_id,
+                stripe_customer_id=_required_id(charge.get("customer"), "Stripe Customer id"),
+            )
+            wallet_ref = client.collection(self._settings.wallets_collection).document(
+                customer_wallet_document_id(owner_uid)
+            )
+            wallet_snapshot = get_transaction_document_snapshot(transaction, wallet_ref)
+
+            if transaction_snapshot.exists:
+                return WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome="charge_refunded",
+                    duplicate=True,
+                )
+
+            if wallet_snapshot.exists:
+                wallet = wallet_snapshot.to_dict() or {}
+                self._validate_wallet(wallet, owner_uid)
+                available_credit = nonnegative_int(
+                    wallet.get("available_credit_nanos", 0),
+                    field_name="available_credit_nanos",
+                )
+                new_available = available_credit - reversed_nanos
+                wallet_updates: dict[str, Any] = {
+                    "available_credit_nanos": new_available,
+                    "updated_at": processed_at,
+                    "last_refund_at": processed_at,
+                }
+                if new_available < 0:
+                    wallet_updates["status"] = "suspended"
+                transaction.update(wallet_ref, wallet_updates)
+
+            transaction.create(
+                transaction_ref,
+                {
+                    "schema_version": 1,
+                    "transaction_id": transaction_id,
+                    "transaction_type": "stripe_charge_refund",
+                    "status": "posted",
+                    "billing_subject_id": owner_uid,
+                    "owner_uid": owner_uid,
+                    "wallet_document_id": customer_wallet_document_id(owner_uid),
+                    "currency": "USD",
+                    "amount_nanos": -reversed_nanos,
+                    "stripe_amount_cents": -amount_refunded_cents,
+                    "stripe_event_id": stripe_event_id,
+                    "stripe_charge_id": charge_id,
+                    "created_at": processed_at,
+                },
+            )
+            transaction.create(
+                event_ref,
+                build_stripe_webhook_event_document(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    stripe_event_created_at=stripe_event_created_at,
+                    stripe_livemode=stripe_livemode,
+                    catalog_environment=self._catalog.environment,
+                    payload_sha256=payload_sha256,
+                    outcome="charge_refunded",
+                    processed_at=processed_at,
+                    billing_account_id=billing_account_id,
+                    billing_subject_id=owner_uid,
+                    owner_uid=owner_uid,
+                    stripe_customer_id=_required_id(charge.get("customer"), "Stripe Customer id"),
+                    wallet_transaction_id=transaction_id,
+                ),
+            )
+            return WebhookResult(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                outcome="charge_refunded",
+                duplicate=False,
+            )
+
+        return self._transaction_runner(client, operation)
+
+    def _handle_charge_dispute_created(
+        self,
+        *,
+        event: Mapping[str, Any],
+        stripe_event_id: str,
+        stripe_event_type: str,
+        stripe_event_created_at: datetime,
+        stripe_livemode: bool,
+        payload_sha256: str,
+    ) -> WebhookResult:
+        dispute_or_charge = _event_object(event)
+        charge_id = _optional_id(dispute_or_charge.get("charge")) or _required_id(dispute_or_charge.get("id"), "Charge/Dispute id")
+        metadata = dispute_or_charge.get("metadata") or {}
+        billing_account_id = _optional_id(metadata.get("billing_account_id"))
+        if not billing_account_id:
+            return self._record_ignored_event(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                stripe_event_created_at=stripe_event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_sha256,
+            )
+        if metadata.get("catalog_environment") != self._catalog.environment:
+            raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
+
+        client = self._firestore_client_factory()
+        account_ref = client.collection(self._settings.billing_accounts_collection).document(
+            billing_account_id
+        )
+        event_ref = client.collection(self._settings.stripe_webhook_events_collection).document(
+            stripe_webhook_event_document_id(stripe_event_id)
+        )
+        transaction_id = f"stripe_dispute_{charge_id}_{stripe_event_id}"
+        transaction_ref = client.collection(self._settings.wallet_transactions_collection).document(
+            transaction_id
+        )
+        processed_at = _as_utc(self._now_factory())
+
+        def operation(transaction: Any) -> WebhookResult:
+            event_snapshot = get_transaction_document_snapshot(transaction, event_ref)
+            account_snapshot = get_transaction_document_snapshot(transaction, account_ref)
+            transaction_snapshot = get_transaction_document_snapshot(transaction, transaction_ref)
+
+            if event_snapshot.exists:
+                return WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
+                    duplicate=True,
+                )
+            if not account_snapshot.exists:
+                raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
+
+            account = account_snapshot.to_dict() or {}
+            owner_uid = account.get("owner_uid")
+            wallet_ref = client.collection(self._settings.wallets_collection).document(
+                customer_wallet_document_id(owner_uid)
+            )
+            wallet_snapshot = get_transaction_document_snapshot(transaction, wallet_ref)
+
+            if transaction_snapshot.exists:
+                return WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome="charge_disputed",
+                    duplicate=True,
+                )
+
+            if wallet_snapshot.exists:
+                transaction.update(
+                    wallet_ref,
+                    {
+                        "status": "suspended",
+                        "updated_at": processed_at,
+                        "last_dispute_at": processed_at,
+                    },
+                )
+
+            transaction.create(
+                transaction_ref,
+                {
+                    "schema_version": 1,
+                    "transaction_id": transaction_id,
+                    "transaction_type": "stripe_charge_dispute",
+                    "status": "disputed",
+                    "billing_subject_id": owner_uid,
+                    "owner_uid": owner_uid,
+                    "wallet_document_id": customer_wallet_document_id(owner_uid),
+                    "currency": "USD",
+                    "stripe_event_id": stripe_event_id,
+                    "stripe_charge_id": charge_id,
+                    "created_at": processed_at,
+                },
+            )
+            transaction.create(
+                event_ref,
+                build_stripe_webhook_event_document(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    stripe_event_created_at=stripe_event_created_at,
+                    stripe_livemode=stripe_livemode,
+                    catalog_environment=self._catalog.environment,
+                    payload_sha256=payload_sha256,
+                    outcome="charge_disputed",
+                    processed_at=processed_at,
+                    billing_account_id=billing_account_id,
+                    billing_subject_id=owner_uid,
+                    owner_uid=owner_uid,
+                    wallet_transaction_id=transaction_id,
+                ),
+            )
+            return WebhookResult(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                outcome="charge_disputed",
                 duplicate=False,
             )
 

@@ -363,3 +363,109 @@ def test_subsequent_topup_credits_existing_wallet_successfully():
     wallet = client.documents[("customer_wallets", wallet_id)]
     assert wallet["available_credit_nanos"] == 15_000_000_000
     assert wallet["lifetime_credited_nanos"] == 15_000_000_000
+
+
+def test_charge_refunded_claws_back_credit_and_suspends_if_negative():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_refund_123",
+        "type": "charge.refunded",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "ch_test_123",
+                "customer": "cus_test_123",
+                "amount": 1000,
+                "amount_refunded": 1000,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                    "topup_package_id": "credit_10_usd",
+                },
+            }
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 5_000_000_000,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"refund_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"refund_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    assert result.duplicate is False
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["available_credit_nanos"] == -5_000_000_000
+    assert wallet["status"] == "suspended"
+
+
+def test_charge_dispute_created_suspends_wallet():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    dispute_event = {
+        "id": "evt_dispute_123",
+        "type": "charge.dispute.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_test_123",
+                "charge": "ch_test_123",
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 10_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"dispute_payload": dispute_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"dispute_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_disputed"
+    assert result.duplicate is False
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"

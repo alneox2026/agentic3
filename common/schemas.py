@@ -35,6 +35,7 @@ class AgentConfig(BaseModel):
     persistence_enabled: bool = True
     auth_policy: str = "firebase"
     model: str | None = "gemini-3.8-flash"
+    reservation_nanos: int | None = Field(default=None, ge=0)
 
     @field_validator("agent_id")
     @classmethod

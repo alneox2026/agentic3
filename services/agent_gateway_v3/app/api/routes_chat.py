@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import datetime, timezone
 import logging
 
@@ -74,6 +76,7 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
         agent_id=agent_config.agent_id,
         request_id=request_context.request_id,
         turn_id=request_context.turn_id,
+        reservation_nanos=agent_config.reservation_nanos,
     )
     try:
         agent_response = await backend_client.chat_buffered_query(
@@ -83,6 +86,9 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
             message=payload.message,
         )
     except ApiError as exc:
+        if billing_reservation:
+            with suppress(Exception):
+                await wallet_reservation_service.release(billing_reservation)
         backend_latency_ms = int(
             (datetime.now(timezone.utc) - backend_started_at).total_seconds() * 1000
         )
@@ -103,6 +109,11 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
             error_status_code=exc.status_code,
             error_details=sanitize_for_diagnostics(exc.details),
         )
+        raise
+    except Exception:
+        if billing_reservation:
+            with suppress(Exception):
+                await wallet_reservation_service.release(billing_reservation)
         raise
     backend_latency_ms = int(
         (datetime.now(timezone.utc) - backend_started_at).total_seconds() * 1000
