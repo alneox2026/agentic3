@@ -28,6 +28,8 @@ class StripeGateway(Protocol):
 
     def retrieve_subscription(self, subscription_id: str) -> Mapping[str, Any]: ...
 
+    def retrieve_charge(self, charge_id: str) -> Mapping[str, Any]: ...
+
     def construct_webhook_event(
         self,
         *,
@@ -141,6 +143,14 @@ class StripeSdkGateway:
             )
         except Exception as exc:
             raise StripeGatewayError("Stripe subscription retrieval failed.") from exc
+
+    def retrieve_charge(self, charge_id: str) -> Mapping[str, Any]:
+        try:
+            return stripe_object_to_mapping(
+                self._client.v1.charges.retrieve(charge_id)
+            )
+        except Exception as exc:
+            raise StripeGatewayError("Stripe charge retrieval failed.") from exc
 
     def construct_webhook_event(
         self,

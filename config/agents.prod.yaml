@@ -57,7 +57,8 @@ agents:
     remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 300000
-    reservation_nanos: 200000000
+    reservation_nanos: 500000000
+    max_output_tokens: 8192
     environment:
       type: remote
       sources:

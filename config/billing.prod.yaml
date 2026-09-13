@@ -1,5 +1,6 @@
 schema_version: 1
 environment: production
+stripe_mode: test
 currency: USD
 
 topup_packages:

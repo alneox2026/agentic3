@@ -199,7 +199,7 @@ class StripeWebhookService:
                 stripe_livemode=stripe_livemode,
                 payload_sha256=payload_hash,
             )
-        if event_type == "charge.refunded":
+        if event_type in {"charge.refunded", "refund.created"}:
             return self._handle_charge_refunded(
                 event=event,
                 stripe_event_id=event_id,
@@ -210,6 +210,15 @@ class StripeWebhookService:
             )
         if event_type == "charge.dispute.created":
             return self._handle_charge_dispute_created(
+                event=event,
+                stripe_event_id=event_id,
+                stripe_event_type=event_type,
+                stripe_event_created_at=event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_hash,
+            )
+        if event_type == "charge.dispute.closed":
+            return self._handle_charge_dispute_closed(
                 event=event,
                 stripe_event_id=event_id,
                 stripe_event_type=event_type,
@@ -897,9 +906,30 @@ class StripeWebhookService:
         stripe_livemode: bool,
         payload_sha256: str,
     ) -> WebhookResult:
-        charge = _event_object(event)
-        charge_id = _required_id(charge.get("id"), "Charge id")
-        metadata = charge.get("metadata") or {}
+        refund_or_charge = _event_object(event)
+        if stripe_event_type == "refund.created":
+            refund_id = _required_id(refund_or_charge.get("id"), "Refund id")
+            charge_id = _optional_id(refund_or_charge.get("charge")) or ""
+            charge: Mapping[str, Any] = {}
+            if charge_id:
+                try:
+                    charge = self._stripe_gateway.retrieve_charge(charge_id)
+                except Exception:
+                    charge = {}
+            metadata = charge.get("metadata") or refund_or_charge.get("metadata") or {}
+            customer_id = _optional_id(charge.get("customer")) or _optional_id(refund_or_charge.get("customer"))
+            amount_refunded_cents = refund_or_charge.get("amount") or 0
+            amount_cents = charge.get("amount") or amount_refunded_cents
+            transaction_id = f"stripe_refund_{refund_id}"
+        else:
+            charge = refund_or_charge
+            charge_id = _required_id(charge.get("id"), "Charge id")
+            metadata = charge.get("metadata") or {}
+            customer_id = _optional_id(charge.get("customer"))
+            amount_cents = charge.get("amount") or 0
+            amount_refunded_cents = charge.get("amount_refunded") or amount_cents
+            transaction_id = f"stripe_refund_{charge_id}_{stripe_event_id}"
+
         billing_account_id = _optional_id(metadata.get("billing_account_id"))
         if not billing_account_id:
             return self._record_ignored_event(
@@ -912,8 +942,6 @@ class StripeWebhookService:
         if metadata.get("catalog_environment") != self._catalog.environment:
             raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
 
-        amount_cents = charge.get("amount") or 0
-        amount_refunded_cents = charge.get("amount_refunded") or amount_cents
         topup_package_id = _optional_id(metadata.get("topup_package_id"))
         if topup_package_id:
             try:
@@ -934,7 +962,6 @@ class StripeWebhookService:
         event_ref = client.collection(self._settings.stripe_webhook_events_collection).document(
             stripe_webhook_event_document_id(stripe_event_id)
         )
-        transaction_id = f"stripe_refund_{charge_id}_{stripe_event_id}"
         transaction_ref = client.collection(self._settings.wallet_transactions_collection).document(
             transaction_id
         )
@@ -956,10 +983,11 @@ class StripeWebhookService:
                 raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
 
             account = account_snapshot.to_dict() or {}
+            resolved_customer_id = customer_id or account.get("stripe_customer_id")
             owner_uid = self._validate_account_for_stripe(
                 account,
                 billing_account_id=billing_account_id,
-                stripe_customer_id=_required_id(charge.get("customer"), "Stripe Customer id"),
+                stripe_customer_id=_required_id(resolved_customer_id, "Stripe Customer id"),
             )
             wallet_ref = client.collection(self._settings.wallets_collection).document(
                 customer_wallet_document_id(owner_uid)
@@ -1023,7 +1051,7 @@ class StripeWebhookService:
                     billing_account_id=billing_account_id,
                     billing_subject_id=owner_uid,
                     owner_uid=owner_uid,
-                    stripe_customer_id=_required_id(charge.get("customer"), "Stripe Customer id"),
+                    stripe_customer_id=_required_id(resolved_customer_id, "Stripe Customer id"),
                     wallet_transaction_id=transaction_id,
                 ),
             )
@@ -1049,6 +1077,12 @@ class StripeWebhookService:
         dispute_or_charge = _event_object(event)
         charge_id = _optional_id(dispute_or_charge.get("charge")) or _required_id(dispute_or_charge.get("id"), "Charge/Dispute id")
         metadata = dispute_or_charge.get("metadata") or {}
+        if not metadata.get("billing_account_id") and dispute_or_charge.get("charge"):
+            try:
+                parent_charge = self._stripe_gateway.retrieve_charge(dispute_or_charge["charge"])
+                metadata = parent_charge.get("metadata") or {}
+            except Exception:
+                pass
         billing_account_id = _optional_id(metadata.get("billing_account_id"))
         if not billing_account_id:
             return self._record_ignored_event(
@@ -1151,6 +1185,105 @@ class StripeWebhookService:
                 stripe_event_id=stripe_event_id,
                 stripe_event_type=stripe_event_type,
                 outcome="charge_disputed",
+                duplicate=False,
+            )
+
+        return self._transaction_runner(client, operation)
+
+    def _handle_charge_dispute_closed(
+        self,
+        *,
+        event: Mapping[str, Any],
+        stripe_event_id: str,
+        stripe_event_type: str,
+        stripe_event_created_at: datetime,
+        stripe_livemode: bool,
+        payload_sha256: str,
+    ) -> WebhookResult:
+        dispute_obj = _event_object(event)
+        charge_id = _optional_id(dispute_obj.get("charge"))
+        metadata = dispute_obj.get("metadata") or {}
+        if not metadata.get("billing_account_id") and charge_id:
+            try:
+                parent_charge = self._stripe_gateway.retrieve_charge(charge_id)
+                metadata = parent_charge.get("metadata") or {}
+            except Exception:
+                pass
+        billing_account_id = _optional_id(metadata.get("billing_account_id"))
+        if not billing_account_id:
+            return self._record_ignored_event(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                stripe_event_created_at=stripe_event_created_at,
+                stripe_livemode=stripe_livemode,
+                payload_sha256=payload_sha256,
+            )
+        if metadata.get("catalog_environment") != self._catalog.environment:
+            raise BillingApiError(400, "stripe_environment_mismatch", "Stripe event is for another environment.")
+
+        status = dispute_obj.get("status")
+        client = self._firestore_client_factory()
+        account_ref = client.collection(self._settings.billing_accounts_collection).document(
+            billing_account_id
+        )
+        event_ref = client.collection(self._settings.stripe_webhook_events_collection).document(
+            stripe_webhook_event_document_id(stripe_event_id)
+        )
+        processed_at = _as_utc(self._now_factory())
+
+        def operation(transaction: Any) -> WebhookResult:
+            event_snapshot = get_transaction_document_snapshot(transaction, event_ref)
+            account_snapshot = get_transaction_document_snapshot(transaction, account_ref)
+
+            if event_snapshot.exists:
+                return WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
+                    duplicate=True,
+                )
+            if not account_snapshot.exists:
+                raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
+
+            account = account_snapshot.to_dict() or {}
+            owner_uid = account.get("owner_uid")
+            wallet_ref = client.collection(self._settings.wallets_collection).document(
+                customer_wallet_document_id(owner_uid)
+            )
+            wallet_snapshot = get_transaction_document_snapshot(transaction, wallet_ref)
+
+            if status == "won" and wallet_snapshot.exists:
+                wallet = wallet_snapshot.to_dict() or {}
+                if wallet.get("status") == "suspended":
+                    transaction.update(
+                        wallet_ref,
+                        {
+                            "status": "active",
+                            "updated_at": processed_at,
+                            "dispute_reinstated_at": processed_at,
+                        },
+                    )
+
+            transaction.create(
+                event_ref,
+                build_stripe_webhook_event_document(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    stripe_event_created_at=stripe_event_created_at,
+                    stripe_livemode=stripe_livemode,
+                    catalog_environment=self._catalog.environment,
+                    payload_sha256=payload_sha256,
+                    outcome="dispute_resolved",
+                    processed_at=processed_at,
+                    billing_account_id=billing_account_id,
+                    billing_subject_id=owner_uid,
+                    owner_uid=owner_uid,
+                ),
+            )
+            return WebhookResult(
+                stripe_event_id=stripe_event_id,
+                stripe_event_type=stripe_event_type,
+                outcome="dispute_resolved",
                 duplicate=False,
             )
 
@@ -1406,7 +1539,14 @@ class StripeWebhookService:
         )
 
     def _validate_event_environment(self, stripe_livemode: bool) -> None:
-        expected_livemode = self._catalog.environment == "production"
+        expected_livemode = (
+            getattr(
+                self._catalog,
+                "stripe_mode",
+                "live" if self._catalog.environment == "production" else "test",
+            )
+            == "live"
+        )
         if stripe_livemode != expected_livemode:
             raise BillingApiError(
                 400,

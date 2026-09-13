@@ -36,6 +36,7 @@ class AgentConfig(BaseModel):
     auth_policy: str = "firebase"
     model: str | None = "gemini-3.8-flash"
     reservation_nanos: int | None = Field(default=None, ge=0)
+    max_output_tokens: int | None = Field(default=8192, ge=16)
 
     @field_validator("agent_id")
     @classmethod

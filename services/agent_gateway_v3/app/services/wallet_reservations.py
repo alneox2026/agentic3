@@ -290,46 +290,26 @@ class WalletReservationService:
         expected_user_id: str,
         expected_agent_id: str,
     ) -> WalletReservation:
-        if (
-            reservation.get("reservation_id") != expected_turn_id
-            or reservation.get("turn_id") != expected_turn_id
-            or reservation.get("billing_subject_id") != expected_subject_id
-            or reservation.get("owner_uid") != expected_user_id
-            or reservation.get("agent_id") != expected_agent_id
-            or reservation.get("status") != "reserved"
-        ):
+        status = reservation.get("status")
+        if status == "reserved":
             raise ApiError(
                 409,
-                "billing_reservation_conflict",
-                "The request already has a conflicting billing reservation.",
+                "turn_in_progress",
+                "The turn is currently in progress.",
+                {"turn_id": expected_turn_id},
             )
-        try:
-            reserved_amount_nanos = nonnegative_int(
-                reservation.get("reserved_amount_nanos"),
-                field_name="reserved_amount_nanos",
-            )
-        except ValueError as exc:
+        if status == "settled":
             raise ApiError(
-                503,
-                "billing_reservation_invalid",
-                "The request billing reservation is temporarily unavailable.",
-            ) from exc
-        expires_at = reservation.get("expires_at")
-        if not isinstance(expires_at, datetime):
-            raise ApiError(
-                503,
-                "billing_reservation_invalid",
-                "The request billing reservation is temporarily unavailable.",
+                409,
+                "turn_already_settled",
+                "The turn has already completed.",
+                {"turn_id": expected_turn_id},
             )
-        return WalletReservation(
-            reservation_id=expected_turn_id,
-            billing_subject_id=expected_subject_id,
-            user_id=expected_user_id,
-            agent_id=expected_agent_id,
-            request_id=str(reservation.get("request_id", "")),
-            reserved_amount_nanos=reserved_amount_nanos,
-            currency=str(reservation.get("currency", "USD")),
-            expires_at=expires_at,
+        raise ApiError(
+            409,
+            "billing_reservation_conflict",
+            "The request already has a conflicting billing reservation.",
+            {"turn_id": expected_turn_id, "status": status},
         )
 
 

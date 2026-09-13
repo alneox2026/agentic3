@@ -60,6 +60,7 @@ def test_production_catalog_loads_successfully() -> None:
     prod_catalog = load_billing_catalog(Path("config/billing.prod.yaml"))
     assert prod_catalog.environment == "production"
     assert prod_catalog.currency == "USD"
+    assert prod_catalog.stripe_mode == "test"
 
 
 def test_environment_prod_normalizes_to_production(tmp_path) -> None:
@@ -85,4 +86,32 @@ monthly_service_fee:
     )
     catalog = load_billing_catalog(catalog_file)
     assert catalog.environment == "production"
+    assert catalog.stripe_mode == "live"
+
+
+def test_stripe_mode_validation(tmp_path) -> None:
+    invalid_file = tmp_path / "billing.bad_mode.yaml"
+    invalid_file.write_text(
+        """
+schema_version: 1
+environment: test
+stripe_mode: invalid_mode
+currency: USD
+topup_packages:
+  credit_5_usd:
+    display_name: $5 token credit
+    stripe_price_id: price_1U3ZHnB5Es3VU3maoEQbMKnC
+    amount_cents: 500
+    credit_nanos: 5000000000
+monthly_service_fee:
+  stripe_price_id: price_1U3ZYBB5Es3VU3maSP6qq6sg
+  amount_cents: 500
+  fee_nanos: 5000000000
+  interval: month
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(BillingCatalogError, match="stripe_mode"):
+        load_billing_catalog(invalid_file)
+
 

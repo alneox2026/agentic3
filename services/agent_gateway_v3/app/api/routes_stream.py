@@ -224,11 +224,12 @@ async def stream_chat(
 ) -> StreamingResponse:
     settings = get_settings()
     agent_config = get_agent_config(agent_id)
+    user_id = await authenticate_request(request)
     request_context = build_request_context(
         agent_id=agent_config.agent_id,
         client_turn_id=payload.client_turn_id,
+        user_id=user_id,
     )
-    user_id = await authenticate_request(request)
     if (
         getattr(settings, "billing_enforcement_enabled", False)
         and not agent_config.persistence_enabled
@@ -502,8 +503,22 @@ async def stream_chat(
                 outcome="api_error",
             )
             if billing_reservation:
-                with suppress(Exception):
-                    await wallet_reservation_service.release(billing_reservation)
+                if diagnostics.normalized_token_event_count == 0:
+                    with suppress(Exception):
+                        await wallet_reservation_service.release(billing_reservation)
+                else:
+                    with suppress(Exception):
+                        await _publish_completed_turn(
+                            agent_config=agent_config,
+                            request_context=request_context,
+                            user_id=user_id,
+                            payload=payload,
+                            thread_id=session_result.thread_id,
+                            session_id=session_result.session_id,
+                            assistant_message=assembler.reply_text(),
+                            usage=assembler.usage,
+                            billing_metadata=billing_metadata,
+                        )
             yield build_error_event(exc.code, exc.message, exc.details)
             yield build_done_event(
                 {
@@ -517,8 +532,22 @@ async def stream_chat(
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
             if billing_reservation:
-                with suppress(Exception):
-                    await wallet_reservation_service.release(billing_reservation)
+                if diagnostics.normalized_token_event_count == 0:
+                    with suppress(Exception):
+                        await wallet_reservation_service.release(billing_reservation)
+                else:
+                    with suppress(Exception):
+                        await _publish_completed_turn(
+                            agent_config=agent_config,
+                            request_context=request_context,
+                            user_id=user_id,
+                            payload=payload,
+                            thread_id=session_result.thread_id,
+                            session_id=session_result.session_id,
+                            assistant_message=assembler.reply_text(),
+                            usage=assembler.usage,
+                            billing_metadata=billing_metadata,
+                        )
             log_structured(
                 LOGGER,
                 logging.ERROR,

@@ -18,6 +18,7 @@ _WEBHOOK_OUTCOMES = frozenset(
         "subscription_state_updated",
         "charge_refunded",
         "charge_disputed",
+        "dispute_resolved",
     }
 )
 

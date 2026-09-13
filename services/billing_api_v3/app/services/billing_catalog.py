@@ -46,6 +46,7 @@ class BillingCatalog:
     currency: str
     topup_packages: dict[str, TopupPackage]
     monthly_service_fee: MonthlyServiceFeePlan
+    stripe_mode: str = "live"
 
     def get_topup_package(self, package_id: str) -> TopupPackage:
         try:
@@ -117,6 +118,14 @@ def load_billing_catalog(path: Path) -> BillingCatalog:
     currency = _required_string(catalog.get("currency"), field_name="currency").upper()
     if currency != "USD":
         raise BillingCatalogError("Only USD billing catalog entries are supported.")
+
+    raw_stripe_mode = catalog.get("stripe_mode")
+    if raw_stripe_mode is not None:
+        stripe_mode = _required_string(raw_stripe_mode, field_name="stripe_mode").strip().lower()
+        if stripe_mode not in {"test", "live"}:
+            raise BillingCatalogError("stripe_mode must be test or live.")
+    else:
+        stripe_mode = "live" if environment == "production" else "test"
 
     raw_packages = _required_mapping(catalog.get("topup_packages"), field_name="topup_packages")
     if not raw_packages:
@@ -196,6 +205,7 @@ def load_billing_catalog(path: Path) -> BillingCatalog:
             fee_nanos=fee_nanos,
             interval=interval,
         ),
+        stripe_mode=stripe_mode,
     )
 
 

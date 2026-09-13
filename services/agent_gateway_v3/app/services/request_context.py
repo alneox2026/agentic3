@@ -17,9 +17,13 @@ class RequestContext:
     agent_id: str
 
 
-def build_request_context(agent_id: str, client_turn_id: str | None = None) -> RequestContext:
+def build_request_context(
+    agent_id: str,
+    client_turn_id: str | None = None,
+    user_id: str | None = None,
+) -> RequestContext:
     if client_turn_id and client_turn_id.strip():
-        turn_id = deterministic_turn_id(agent_id, client_turn_id.strip())
+        turn_id = deterministic_turn_id(agent_id, client_turn_id.strip(), user_id=(user_id or "").strip())
     else:
         turn_id = new_turn_id()
     return RequestContext(

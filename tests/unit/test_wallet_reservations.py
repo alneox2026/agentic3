@@ -230,3 +230,70 @@ def test_release_restores_credit_immediately(monkeypatch):
     assert res_doc["status"] == "released"
     assert res_doc["released_amount_nanos"] == 500_000_000
 
+
+def test_reserve_rejects_duplicate_turn_in_progress(monkeypatch):
+    _enable_billing(monkeypatch)
+    settings = get_settings()
+    client = FakeClient()
+    user_id = "user-1"
+    wallet_id = customer_wallet_document_id(user_id)
+    client.documents[(settings.wallets_collection, wallet_id)] = _wallet(user_id, available_credit_nanos=1_000_000_000)
+    service = WalletReservationService(
+        firestore_client_factory=lambda: client,
+        transaction_runner=_run_transaction,
+    )
+
+    # First reservation succeeds
+    res1 = asyncio.run(
+        service.reserve(
+            user_id=user_id,
+            agent_id="maxima",
+            request_id="req-1",
+            turn_id="turn-idemp",
+        )
+    )
+    assert res1 is not None
+
+    # Duplicate reservation for the same in-progress turn raises 409 turn_in_progress
+    with pytest.raises(ApiError) as exc_info:
+        asyncio.run(
+            service.reserve(
+                user_id=user_id,
+                agent_id="maxima",
+                request_id="req-2",
+                turn_id="turn-idemp",
+            )
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.code == "turn_in_progress"
+
+
+def test_reserve_rejects_duplicate_turn_already_settled(monkeypatch):
+    _enable_billing(monkeypatch)
+    settings = get_settings()
+    client = FakeClient()
+    user_id = "user-1"
+    wallet_id = customer_wallet_document_id(user_id)
+    client.documents[(settings.wallets_collection, wallet_id)] = _wallet(user_id, available_credit_nanos=1_000_000_000)
+    client.documents[(settings.billing_reservations_collection, "turn-settled")] = {
+        "status": "settled",
+        "turn_id": "turn-settled",
+    }
+    service = WalletReservationService(
+        firestore_client_factory=lambda: client,
+        transaction_runner=_run_transaction,
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        asyncio.run(
+            service.reserve(
+                user_id=user_id,
+                agent_id="maxima",
+                request_id="req-3",
+                turn_id="turn-settled",
+            )
+        )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.code == "turn_already_settled"
+
+

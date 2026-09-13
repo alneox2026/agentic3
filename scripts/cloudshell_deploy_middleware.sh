@@ -73,9 +73,10 @@ EOF
 
 terraform init -backend-config=backend.hcl -reconfigure
 
-EXTRA_TFVARS=""
+BILLING_CATALOG_PATH="${BILLING_CATALOG_PATH:-/app/config/billing.prod.yaml}"
+EXTRA_TFVARS=",\"billing_api_catalog_path\": \"${BILLING_CATALOG_PATH}\""
 if [ -n "${STRIPE_WEBHOOK_SIGNING_SECRET_ID:-}" ]; then
-  EXTRA_TFVARS=",\"billing_api_stripe_webhook_signing_secret_id\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_ID}\""
+  EXTRA_TFVARS="${EXTRA_TFVARS},\"billing_api_stripe_webhook_signing_secret_id\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_ID}\""
 fi
 
 cat > terraform.auto.tfvars.json <<EOF

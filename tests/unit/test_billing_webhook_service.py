@@ -80,11 +80,12 @@ class FakeFirestore:
 
 
 class FakeStripeGateway:
-    def __init__(self, events, checkout_sessions, invoices, subscriptions):
+    def __init__(self, events, checkout_sessions, invoices, subscriptions, charges=None):
         self.events = events
         self.checkout_sessions = checkout_sessions
         self.invoices = invoices
         self.subscriptions = subscriptions
+        self.charges = charges or {}
 
     def construct_webhook_event(self, *, payload, signature, signing_secret, tolerance_seconds):
         if signature != "signature":
@@ -99,6 +100,9 @@ class FakeStripeGateway:
 
     def retrieve_subscription(self, subscription_id):
         return self.subscriptions[subscription_id]
+
+    def retrieve_charge(self, charge_id):
+        return self.charges[charge_id]
 
 
 def _run_transaction(client, operation):
@@ -469,3 +473,215 @@ def test_charge_dispute_created_suspends_wallet():
     assert result.duplicate is False
     wallet = client.documents[("customer_wallets", wallet_id)]
     assert wallet["status"] == "suspended"
+
+
+def test_refund_created_processes_individual_amount_and_keys_on_refund_id():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_refund_123",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_test_part1",
+                "charge": "ch_test_123",
+                "amount": 200,
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_test_123",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "topup_package_id": "credit_10_usd",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 10_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"refund_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_test_123": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"refund_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    assert result.duplicate is False
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    # $2 out of $10 refund should reverse 2_000_000_000 nanos out of 10_000_000_000
+    assert wallet["available_credit_nanos"] == 8_000_000_000
+    assert ("wallet_transactions", "stripe_refund_re_test_part1") in client.documents
+
+
+def test_charge_dispute_retrieves_charge_metadata_when_dispute_metadata_empty():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    dispute_event = {
+        "id": "evt_dispute_456",
+        "type": "charge.dispute.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_test_456",
+                "charge": "ch_parent_456",
+                "metadata": {},  # Empty metadata on dispute object
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_parent_456",
+        "customer": "cus_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 10_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"dispute_payload": dispute_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_parent_456": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"dispute_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_disputed"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+
+
+def test_charge_dispute_closed_won_reinstates_wallet():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    dispute_event = {
+        "id": "evt_dispute_closed_789",
+        "type": "charge.dispute.closed",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_test_789",
+                "charge": "ch_parent_789",
+                "status": "won",
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_parent_789",
+        "customer": "cus_123",
+        "amount": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "suspended",
+        "available_credit_nanos": 10_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 10_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"dispute_won_payload": dispute_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+        charges={"ch_parent_789": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"dispute_won_payload", stripe_signature="signature")
+
+    assert result.outcome == "dispute_resolved"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "active"
+
+
+def test_production_catalog_with_stripe_mode_test_accepts_test_events():
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    event = {
+        "id": "evt_ignored_test_mode",
+        "type": "unhandled.event",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {"object": {"id": "obj_123"}},
+    }
+    client = FakeFirestore()
+    stripe = FakeStripeGateway(
+        events={b"test_payload": event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+    )
+    prod_catalog = load_billing_catalog(Path("config/billing.prod.yaml"))
+    assert prod_catalog.environment == "production"
+    assert prod_catalog.stripe_mode == "test"
+
+    service = StripeWebhookService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        catalog=prod_catalog,
+        transaction_runner=_run_transaction,
+        now_factory=lambda: now,
+        webhook_signing_secret="whsec_test",
+    )
+
+    result = service.handle_sync(raw_payload=b"test_payload", stripe_signature="signature")
+    assert result.outcome == "ignored"
+

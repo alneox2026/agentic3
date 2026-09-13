@@ -46,11 +46,12 @@ async def chat(request: Request, agent_id: str, payload: ChatRequest) -> ChatRes
             "This agent cannot be used while prepaid billing is enabled because settlement is unavailable.",
             {"agent_id": agent_config.agent_id},
         )
+    user_id = await authenticate_request(request)
     request_context = build_request_context(
         agent_id=agent_config.agent_id,
         client_turn_id=payload.client_turn_id,
+        user_id=user_id,
     )
-    user_id = await authenticate_request(request)
     backend_client = await get_chat_backend_client(agent_config)
     session_service = await get_chat_session_service()
     log_structured(
