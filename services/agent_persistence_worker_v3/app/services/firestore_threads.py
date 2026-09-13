@@ -51,9 +51,14 @@ class FirestoreThreadsRepository:
             "thread_id": event.thread_id,
             "status": existing_status or STATUS_ACTIVE,
         }
-        if not existing_thread:
-            payload["created_at"] = event.created_at
+        existing_title = ""
+        if existing_thread:
+            existing_title = str(existing_thread.get("title", "")).strip()
+        if not existing_title:
             payload["title"] = self._preview(event.user_message, THREAD_TITLE_MAX_CHARS)
+
+        if not existing_thread or "created_at" not in existing_thread:
+            payload["created_at"] = event.created_at
 
         if self._should_update_summary(existing_thread, event.created_at):
             payload.update(
