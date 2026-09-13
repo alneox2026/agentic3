@@ -104,6 +104,15 @@ class FakeStripeGateway:
     def retrieve_charge(self, charge_id):
         return self.charges[charge_id]
 
+    def cancel_subscription(self, subscription_id):
+        if not hasattr(self, "cancelled_subscriptions"):
+            self.cancelled_subscriptions = []
+        self.cancelled_subscriptions.append(subscription_id)
+        sub = dict(self.subscriptions.get(subscription_id, {"id": subscription_id}))
+        sub["status"] = "canceled"
+        self.subscriptions[subscription_id] = sub
+        return sub
+
 
 def _run_transaction(client, operation):
     return operation(client.transaction())
@@ -1041,6 +1050,262 @@ def test_charge_dispute_created_does_not_overwrite_refund_debt_suspension():
     # Refuses to overwrite refund_debt
     assert wallet["suspension_reason"] == "refund_debt"
     assert "dispute" in wallet["suspension_reasons"]
+    assert "dispute:dp_test_debt" in wallet["suspension_reasons"]
     assert "refund_debt" in wallet["suspension_reasons"]
+
+
+def test_topup_recovers_wallet_from_negative_balance_and_clears_refund_debt():
+    """A topup on a wallet with negative balance from refund_debt successfully credits the wallet and clears the suspension."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    topup_event = {
+        "id": "evt_topup_recovery",
+        "type": "checkout.session.completed",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {"object": {"id": "cs_topup_recovery"}},
+    }
+    checkout_session = {
+        "id": "cs_topup_recovery",
+        "livemode": False,
+        "mode": "payment",
+        "payment_status": "paid",
+        "customer": "cus_test_123",
+        "payment_intent": "pi_recovery_123",
+        "metadata": {
+            "billing_account_id": account_id,
+            "topup_package_id": "credit_10_usd",
+            "checkout_kind": "topup",
+            "catalog_environment": "test",
+        },
+        "line_items": {
+            "data": [
+                {"price": "price_1U3ZKOB5Es3VU3maflfGkdrX", "quantity": 1},
+            ]
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "suspended",
+        "suspension_reason": "refund_debt",
+        "suspension_reasons": ["refund_debt"],
+        "available_credit_nanos": -2_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"topup_recovery_payload": topup_event},
+        checkout_sessions={"cs_topup_recovery": checkout_session},
+        invoices={},
+        subscriptions={},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"topup_recovery_payload", stripe_signature="signature")
+
+    assert result.outcome == "topup_credited"
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    # -2B + 10B = +8B
+    assert wallet["available_credit_nanos"] == 8_000_000_000
+    assert wallet["status"] == "active"
+    assert wallet["suspension_reason"] is None
+    assert "refund_debt" not in wallet["suspension_reasons"]
+
+
+def test_simultaneous_disputes_tracked_independently():
+    """Two concurrent disputes write distinct tags; resolving one won does not reactivate the wallet while the other is open."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+
+    event_dp1 = {
+        "id": "evt_dp1_created",
+        "type": "charge.dispute.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_1",
+                "charge": "ch_1",
+                "status": "needs_response",
+                "metadata": {"billing_account_id": account_id, "catalog_environment": "test"},
+            }
+        },
+    }
+    event_dp2 = {
+        "id": "evt_dp2_created",
+        "type": "charge.dispute.created",
+        "created": 1786492810,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_2",
+                "charge": "ch_2",
+                "status": "needs_response",
+                "metadata": {"billing_account_id": account_id, "catalog_environment": "test"},
+            }
+        },
+    }
+    event_dp1_won = {
+        "id": "evt_dp1_closed_won",
+        "type": "charge.dispute.closed",
+        "created": 1786492900,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_1",
+                "charge": "ch_1",
+                "status": "won",
+                "metadata": {"billing_account_id": account_id, "catalog_environment": "test"},
+            }
+        },
+    }
+    event_dp2_won = {
+        "id": "evt_dp2_closed_won",
+        "type": "charge.dispute.closed",
+        "created": 1786493000,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "dp_2",
+                "charge": "ch_2",
+                "status": "won",
+                "metadata": {"billing_account_id": account_id, "catalog_environment": "test"},
+            }
+        },
+    }
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "suspension_reason": None,
+        "suspension_reasons": [],
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway(
+        events={
+            b"dp1_created": event_dp1,
+            b"dp2_created": event_dp2,
+            b"dp1_won": event_dp1_won,
+            b"dp2_won": event_dp2_won,
+        },
+        checkout_sessions={},
+        invoices={},
+        subscriptions={},
+    )
+    service = _service(client, stripe, now)
+
+    # 1. Dispute 1 created -> suspended
+    service.handle_sync(raw_payload=b"dp1_created", stripe_signature="signature")
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+    assert "dispute:dp_1" in wallet["suspension_reasons"]
+
+    # 2. Dispute 2 created -> suspended, both tags present
+    service.handle_sync(raw_payload=b"dp2_created", stripe_signature="signature")
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+    assert "dispute:dp_1" in wallet["suspension_reasons"]
+    assert "dispute:dp_2" in wallet["suspension_reasons"]
+
+    # 3. Dispute 1 won -> dp_1 removed, but dp_2 still open -> wallet REMAINS suspended
+    service.handle_sync(raw_payload=b"dp1_won", stripe_signature="signature")
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "suspended"
+    assert "dispute:dp_1" not in wallet["suspension_reasons"]
+    assert "dispute:dp_2" in wallet["suspension_reasons"]
+    assert wallet["suspension_reason"] == "dispute"
+
+    # 4. Dispute 2 won -> dp_2 removed -> no disputes remain -> wallet REINSTATED to active
+    service.handle_sync(raw_payload=b"dp2_won", stripe_signature="signature")
+    wallet = client.documents[("customer_wallets", wallet_id)]
+    assert wallet["status"] == "active"
+    assert wallet["suspension_reason"] is None
+    assert "dispute:dp_2" not in wallet["suspension_reasons"]
+
+
+def test_refund_created_full_combined_topup_cancels_subscription():
+    """A full refund of a combined initial checkout cancels the Stripe subscription."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_full_combined_cancel_sub",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_combined_cancel",
+                "charge": "ch_combined_cancel",
+                "amount": 1000,
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_combined_cancel",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "package_500",
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_billing_accounts", account_id)]["stripe_subscription_id"] = "sub_combined_123"
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"combined_refund_cancel_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={"sub_combined_123": {"id": "sub_combined_123", "status": "active"}},
+        charges={"ch_combined_cancel": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"combined_refund_cancel_payload", stripe_signature="signature")
+
+    assert result.outcome == "charge_refunded"
+    assert "sub_combined_123" in getattr(stripe, "cancelled_subscriptions", [])
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+
 
 

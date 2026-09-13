@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -401,23 +402,35 @@ class StripeWebhookService:
             wallet = wallet_snapshot.to_dict() or {}
             if wallet_snapshot.exists:
                 self._validate_wallet(wallet, owner_uid)
-                available_credit = nonnegative_int(
-                    wallet.get("available_credit_nanos"),
-                    field_name="available_credit_nanos",
-                )
+                available_credit = int(wallet.get("available_credit_nanos", 0))
                 lifetime_credited = nonnegative_int(
                     wallet.get("lifetime_credited_nanos", 0),
                     field_name="lifetime_credited_nanos",
                 )
-                transaction.update(
-                    wallet_ref,
-                    {
-                        "available_credit_nanos": available_credit + package.credit_nanos,
-                        "lifetime_credited_nanos": lifetime_credited + package.credit_nanos,
-                        "updated_at": processed_at,
-                        "last_credit_at": processed_at,
-                    },
-                )
+                new_available = available_credit + package.credit_nanos
+                existing_reasons = list(wallet.get("suspension_reasons") or [])
+                existing_reason = wallet.get("suspension_reason")
+                if existing_reason and existing_reason not in existing_reasons:
+                    existing_reasons.append(existing_reason)
+
+                wallet_updates: dict[str, Any] = {
+                    "available_credit_nanos": new_available,
+                    "lifetime_credited_nanos": lifetime_credited + package.credit_nanos,
+                    "updated_at": processed_at,
+                    "last_credit_at": processed_at,
+                }
+                # When balance is brought non-negative, clear refund_debt
+                if new_available >= 0:
+                    if "refund_debt" in existing_reasons:
+                        existing_reasons.remove("refund_debt")
+                    wallet_updates["suspension_reasons"] = existing_reasons
+                    if not existing_reasons:
+                        wallet_updates["status"] = "active"
+                        wallet_updates["suspension_reason"] = None
+                    elif wallet.get("suspension_reason") == "refund_debt":
+                        wallet_updates["suspension_reason"] = existing_reasons[0]
+
+                transaction.update(wallet_ref, wallet_updates)
             else:
                 transaction.create(
                     wallet_ref,
@@ -1047,10 +1060,7 @@ class StripeWebhookService:
             if wallet_snapshot.exists:
                 wallet = wallet_snapshot.to_dict() or {}
                 self._validate_wallet(wallet, owner_uid)
-                available_credit = nonnegative_int(
-                    wallet.get("available_credit_nanos", 0),
-                    field_name="available_credit_nanos",
-                )
+                available_credit = int(wallet.get("available_credit_nanos", 0))
                 new_available = available_credit - reversed_nanos
                 existing_reasons = list(wallet.get("suspension_reasons") or [])
                 existing_reason = wallet.get("suspension_reason")
@@ -1078,6 +1088,20 @@ class StripeWebhookService:
                     wallet_updates["review_reason"] = review_reason
 
                 transaction.update(wallet_ref, wallet_updates)
+
+            if is_combined_charge and amount_refunded_cents >= amount_cents:
+                stripe_sub_id = account.get("stripe_subscription_id")
+                if stripe_sub_id:
+                    with suppress(Exception):
+                        self._stripe_gateway.cancel_subscription(stripe_sub_id)
+                    transaction.update(
+                        account_ref,
+                        {
+                            "subscription_status": "canceled",
+                            "subscription_canceled_at": processed_at,
+                            "updated_at": processed_at,
+                        },
+                    )
 
             if requires_manual_review:
                 transaction.update(
@@ -1216,6 +1240,11 @@ class StripeWebhookService:
                 existing_reasons = list(wallet.get("suspension_reasons") or [])
                 if existing_reason and existing_reason not in existing_reasons:
                     existing_reasons.append(existing_reason)
+
+                dispute_id = _optional_id(dispute_or_charge.get("id")) or stripe_event_id
+                dispute_tag = f"dispute:{dispute_id}"
+                if dispute_tag not in existing_reasons:
+                    existing_reasons.append(dispute_tag)
                 if "dispute" not in existing_reasons:
                     existing_reasons.append("dispute")
 
@@ -1226,7 +1255,7 @@ class StripeWebhookService:
                     "last_dispute_at": processed_at,
                 }
                 # Refuse to overwrite an existing non-dispute suspension reason (e.g. refund_debt)
-                if existing_status == "suspended" and existing_reason and existing_reason != "dispute":
+                if existing_status == "suspended" and existing_reason and not existing_reason.startswith("dispute"):
                     wallet_updates["suspension_reason"] = existing_reason
                 else:
                     wallet_updates["suspension_reason"] = "dispute"
@@ -1337,17 +1366,25 @@ class StripeWebhookService:
 
             if status == "won" and wallet_snapshot.exists:
                 wallet = wallet_snapshot.to_dict() or {}
-                existing_reasons = [r for r in (wallet.get("suspension_reasons") or []) if r != "dispute"]
+                dispute_id = _optional_id(dispute_obj.get("id")) or stripe_event_id
+                dispute_tag = f"dispute:{dispute_id}"
+                existing_reasons = [
+                    r for r in (wallet.get("suspension_reasons") or [])
+                    if r != dispute_tag
+                ]
+                has_remaining_dispute = any(r.startswith("dispute:") for r in existing_reasons)
+                if not has_remaining_dispute:
+                    existing_reasons = [r for r in existing_reasons if r != "dispute"]
+
                 available_credit = int(wallet.get("available_credit_nanos", 0))
                 has_refund_debt = available_credit < 0 or wallet.get("suspension_reason") == "refund_debt" or "refund_debt" in existing_reasons
 
                 if wallet.get("status") == "suspended":
-                    # Only reinstate to active if no other suspension causes remain (not in debt, no remaining reasons)
-                    # and the primary suspension reason was dispute (or None)
+                    # Only reinstate to active if no other suspension causes remain (not in debt, no remaining disputes or other reasons)
                     if (
                         not has_refund_debt
+                        and not has_remaining_dispute
                         and not existing_reasons
-                        and wallet.get("suspension_reason") in ("dispute", None)
                     ):
                         transaction.update(
                             wallet_ref,
@@ -1360,12 +1397,16 @@ class StripeWebhookService:
                             },
                         )
                     else:
-                        # Retain suspension for remaining reasons (e.g. refund_debt)
-                        retained_reason = (
-                            "refund_debt"
-                            if has_refund_debt
-                            else (existing_reasons[0] if existing_reasons else wallet.get("suspension_reason"))
-                        )
+                        # Retain suspension for remaining reasons (e.g. remaining dispute or refund_debt)
+                        if has_remaining_dispute:
+                            retained_reason = "dispute"
+                        elif has_refund_debt:
+                            retained_reason = "refund_debt"
+                        elif existing_reasons:
+                            retained_reason = existing_reasons[0]
+                        else:
+                            retained_reason = wallet.get("suspension_reason")
+
                         transaction.update(
                             wallet_ref,
                             {

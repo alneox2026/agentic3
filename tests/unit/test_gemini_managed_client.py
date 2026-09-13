@@ -57,8 +57,8 @@ async def test_build_interaction_payload(managed_agent_config: AgentConfig):
     assert payload["stream"] is True
     assert payload["agent_config"]["model"] == "gemini-3.8-flash"
     assert payload["agent_config"]["max_total_tokens"] == 50000
-    assert payload["agent_config"]["max_output_tokens"] == 8192
-    assert payload["generation_config"] == {"max_output_tokens": 8192}
+    assert "generation_config" not in payload
+    assert "max_output_tokens" not in payload["agent_config"]
     assert payload["previous_interaction_id"] == "interactions/prev_123"
     assert payload["environment"] == "environments/env_456"
 
@@ -213,4 +213,59 @@ def test_extract_text_fragments_nested_formats():
         "outputs": [{"text": "Direct output."}]
     }
     assert client.extract_text_fragments(payload_direct_outputs) == ["Direct output."]
+
+    # May 2026 Interactions API schema: steps[].content[].text
+    payload_steps = {
+        "steps": [
+            {"content": [{"type": "text", "text": "Step 1 text."}]},
+            {"content": [{"type": "text", "text": "Step 2 text."}]},
+        ]
+    }
+    assert client.extract_text_fragments(payload_steps) == ["Step 1 text.", "Step 2 text."]
+
+    # Step wrapper with content list
+    payload_step_content = {
+        "step": {
+            "content": [{"type": "text", "text": "Step content."}]
+        }
+    }
+    assert client.extract_text_fragments(payload_step_content) == ["Step content."]
+
+
+def test_extract_text_from_interaction_steps_schema():
+    """Interaction parsing handles current May 2026 steps[].content[].text structure."""
+    client = GeminiManagedClient()
+
+    # steps with content list
+    interaction = {
+        "steps": [
+            {"content": [{"type": "text", "text": "Analysis complete."}]},
+            {"content": [{"type": "text", "text": "Details follow."}]},
+        ]
+    }
+    assert client._extract_text_from_interaction(interaction) == "Analysis complete.\nDetails follow."
+
+    # steps with content parts
+    interaction_parts = {
+        "steps": [
+            {"content": {"parts": [{"text": "Part A text."}]}},
+        ]
+    }
+    assert client._extract_text_from_interaction(interaction_parts) == "Part A text."
+
+
+@pytest.mark.anyio
+async def test_send_request_raises_connect_timeout_with_tag():
+    """Connection errors in _send_request set timeout_type='connect' and code ending in _connect_timeout."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.post = AsyncMock(side_effect=httpx.ConnectTimeout("Connection refused"))
+    client = GeminiManagedClient(http_client=mock_http)
+
+    with pytest.raises(Exception) as exc_info:
+        await client._send_request("https://fake.url", {}, {})
+
+    err = exc_info.value
+    assert err.code == "managed_agent_connect_timeout"
+    assert err.details.get("timeout_type") == "connect"
+
 

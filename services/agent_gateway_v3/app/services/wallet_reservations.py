@@ -138,10 +138,7 @@ class WalletReservationService:
                 )
 
             try:
-                available_credit_nanos = nonnegative_int(
-                    wallet.get("available_credit_nanos"),
-                    field_name="available_credit_nanos",
-                )
+                available_credit_nanos = int(wallet.get("available_credit_nanos", 0))
                 reserved_credit_nanos = nonnegative_int(
                     wallet.get("reserved_credit_nanos", 0),
                     field_name="reserved_credit_nanos",
@@ -249,10 +246,7 @@ class WalletReservationService:
             wallet_snapshot = get_transaction_document_snapshot(transaction, wallet_ref)
             if wallet_snapshot.exists:
                 wallet = wallet_snapshot.to_dict() or {}
-                available = nonnegative_int(
-                    wallet.get("available_credit_nanos", 0),
-                    field_name="available_credit_nanos",
-                )
+                available = int(wallet.get("available_credit_nanos", 0))
                 reserved = nonnegative_int(
                     wallet.get("reserved_credit_nanos", 0),
                     field_name="reserved_credit_nanos",

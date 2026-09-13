@@ -194,19 +194,26 @@ class GeminiManagedClient:
                             payload=parsed_payload,
                         )
 
-        except httpx.TimeoutException as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             raise ApiError(
                 504,
-                "managed_agent_timeout",
-                "Gemini Managed Agent timed out while generating a response.",
-                {"detail": str(exc)},
+                "managed_agent_connect_timeout",
+                f"Failed connecting to Gemini Interactions API stream: {exc}",
+                {"timeout_type": "connect", "detail": str(exc), "reason": "connect timed out"},
+            ) from exc
+        except (httpx.ReadTimeout, httpx.TimeoutException) as exc:
+            raise ApiError(
+                504,
+                "managed_agent_read_timeout",
+                f"Gemini Managed Agent timed out while generating a response: {exc}",
+                {"timeout_type": "read", "detail": str(exc), "reason": "read timed out"},
             ) from exc
         except httpx.RequestError as exc:
             raise ApiError(
                 502,
-                "managed_agent_connection_error",
-                "Failed to connect to Google Gemini Interactions API.",
-                {"detail": str(exc)},
+                "managed_agent_unreachable",
+                f"Failed to connect to Google Gemini Interactions API: {exc}",
+                {"timeout_type": "connect", "detail": str(exc), "reason": "upstream unreachable"},
             ) from exc
 
     def extract_text_fragments(self, event_payload: dict[str, object]) -> list[str]:
@@ -255,7 +262,7 @@ class GeminiManagedClient:
                     if isinstance(out, dict) and "text" in out and isinstance(out["text"], str):
                         fragments.append(out["text"])
 
-        # Step wrapper (e.g. step.completed or step delta)
+        # Step wrapper (e.g. step.completed, step delta, or step content)
         step = event_payload.get("step")
         if isinstance(step, dict):
             if "output_text" in step and isinstance(step["output_text"], str):
@@ -265,6 +272,38 @@ class GeminiManagedClient:
             step_delta = step.get("delta")
             if isinstance(step_delta, dict) and "text" in step_delta and isinstance(step_delta["text"], str):
                 fragments.append(step_delta["text"])
+            content = step.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "text" in item and isinstance(item["text"], str):
+                        fragments.append(item["text"])
+            elif isinstance(content, dict):
+                if "text" in content and isinstance(content["text"], str):
+                    fragments.append(content["text"])
+                parts = content.get("parts")
+                if isinstance(parts, list):
+                    for p in parts:
+                        if isinstance(p, dict) and "text" in p and isinstance(p["text"], str):
+                            fragments.append(p["text"])
+
+        # Steps list directly on event_payload (May 2026 Interactions API schema)
+        steps = event_payload.get("steps")
+        if isinstance(steps, list):
+            for s in steps:
+                if isinstance(s, dict):
+                    content = s.get("content")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and "text" in item and isinstance(item["text"], str):
+                                fragments.append(item["text"])
+                    elif isinstance(content, dict):
+                        if "text" in content and isinstance(content["text"], str):
+                            fragments.append(content["text"])
+                        parts = content.get("parts")
+                        if isinstance(parts, list):
+                            for p in parts:
+                                if isinstance(p, dict) and "text" in p and isinstance(p["text"], str):
+                                    fragments.append(p["text"])
 
         # Outputs list directly on event_payload
         outputs = event_payload.get("outputs")
@@ -300,9 +339,6 @@ class GeminiManagedClient:
             },
         }
 
-        if agent_config.max_output_tokens is not None:
-            payload["agent_config"]["max_output_tokens"] = agent_config.max_output_tokens
-            payload["generation_config"] = {"max_output_tokens": agent_config.max_output_tokens}
 
         # Thread continuation: preserve state, files, and workspace
         if previous_interaction_id:
@@ -369,15 +405,27 @@ class GeminiManagedClient:
                         {"status_code": response.status_code, "detail": response.text, "reason": response.text},
                     )
                 return response
-            except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(backoff)
                     backoff *= 2.0
                     continue
                 raise ApiError(
                     504,
-                    "managed_agent_connection_failure",
+                    "managed_agent_connect_timeout",
                     f"Failed connecting to Gemini Interactions API after {max_retries} attempts: {exc}",
+                    {"timeout_type": "connect", "detail": str(exc), "reason": "connect timed out"},
+                ) from exc
+            except (httpx.ReadTimeout, httpx.TimeoutException) as exc:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                raise ApiError(
+                    504,
+                    "managed_agent_read_timeout",
+                    f"Read timed out from Gemini Interactions API after {max_retries} attempts: {exc}",
+                    {"timeout_type": "read", "detail": str(exc), "reason": "read timed out"},
                 ) from exc
 
         raise ApiError(500, "managed_agent_unknown_error", "Unexpected error during interaction request.")
@@ -395,6 +443,35 @@ class GeminiManagedClient:
             return str(interaction["output_text"])
         if "text" in interaction:
             return str(interaction["text"])
+
+        # Current Interactions API May 2026 schema: steps[].content[].text
+        steps = interaction.get("steps")
+        if isinstance(steps, list):
+            texts = []
+            for s in steps:
+                if isinstance(s, dict):
+                    content = s.get("content")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and "text" in item and item["text"]:
+                                texts.append(str(item["text"]))
+                            elif isinstance(item, str) and item:
+                                texts.append(item)
+                    elif isinstance(content, dict):
+                        if "text" in content and content["text"]:
+                            texts.append(str(content["text"]))
+                        parts = content.get("parts")
+                        if isinstance(parts, list):
+                            for p in parts:
+                                if isinstance(p, dict) and "text" in p and p["text"]:
+                                    texts.append(str(p["text"]))
+                    elif "output_text" in s and s["output_text"]:
+                        texts.append(str(s["output_text"]))
+                    elif "text" in s and s["text"]:
+                        texts.append(str(s["text"]))
+            if texts:
+                return "\n".join(texts)
+
         outputs = interaction.get("outputs", [])
         if isinstance(outputs, list):
             texts = [str(o.get("text", "")) for o in outputs if isinstance(o, dict) and "text" in o]

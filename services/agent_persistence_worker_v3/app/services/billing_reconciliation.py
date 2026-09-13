@@ -141,10 +141,7 @@ class BillingReconciliationService:
                     current_reservation.get("reserved_amount_nanos"),
                     field_name="reserved_amount_nanos",
                 )
-                available_credit_nanos = nonnegative_int(
-                    wallet.get("available_credit_nanos"),
-                    field_name="available_credit_nanos",
-                )
+                available_credit_nanos = int(wallet.get("available_credit_nanos", 0))
                 reserved_credit_nanos = nonnegative_int(
                     wallet.get("reserved_credit_nanos"),
                     field_name="reserved_credit_nanos",

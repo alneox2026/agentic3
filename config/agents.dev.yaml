@@ -57,6 +57,7 @@ agents:
     remote_agent_id: antigravity-preview-05-2026
     model: gemini-3.8-flash
     max_total_tokens: 300000
+    reservation_nanos: 1250000000  # $1.25 covers 300k tokens at $3.75/M
     environment:
       type: remote
       sources:

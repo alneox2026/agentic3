@@ -162,10 +162,7 @@ class BillingSettlementService:
                     reservation.get("reserved_amount_nanos"),
                     field_name="reserved_amount_nanos",
                 )
-                available_credit_nanos = nonnegative_int(
-                    wallet.get("available_credit_nanos"),
-                    field_name="available_credit_nanos",
-                )
+                available_credit_nanos = int(wallet.get("available_credit_nanos", 0))
                 reserved_credit_nanos = nonnegative_int(
                     wallet.get("reserved_credit_nanos"),
                     field_name="reserved_credit_nanos",
@@ -468,7 +465,7 @@ def _settlement_amounts(
         )
 
     additional_needed = estimated_cost_nanos - reserved_amount_nanos
-    additional_collected = min(additional_needed, available_credit_nanos)
+    additional_collected = max(0, min(additional_needed, available_credit_nanos))
     settled_amount_nanos = reserved_amount_nanos + additional_collected
     shortfall_nanos = estimated_cost_nanos - settled_amount_nanos
     status = "settled" if shortfall_nanos == 0 else "settled_shortfall"
