@@ -79,7 +79,7 @@ class CancellationReconciliationService:
                 getattr(self._settings, "cancellation_reconciliation_lease_seconds", 180),
             )
         )
-        self._lease_seconds = max(10, lease_seconds if lease_seconds is not None else default_lease)
+        self._lease_seconds = max(180, lease_seconds if lease_seconds is not None else default_lease)
 
     async def reconcile_intents(self, *, batch_size: int = 50) -> CancellationReconciliationResult:
         return await asyncio.to_thread(self.reconcile_intents_sync, batch_size=batch_size)

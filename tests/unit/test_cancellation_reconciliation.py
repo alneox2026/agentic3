@@ -769,9 +769,7 @@ def test_reconcile_migration_paginates_with_intermediate_checkpoint() -> None:
 
 
 def test_lease_seconds_clamped_to_safe_minimum() -> None:
-    """Accidental 0 or negative lease seconds must be clamped to safe minimum of 10s."""
-    from services.billing_api_v3.app.services.webhook_service import StripeWebhookService
-
+    """Accidental 0 or values below 180 must be clamped to safe operational floor of 180s."""
     raw_settings = BillingApiSettings(
         project_id="test",
         region="us-central1",
@@ -795,6 +793,6 @@ def test_lease_seconds_clamped_to_safe_minimum() -> None:
         stripe_gateway=FakeStripeGateway(),
         settings=raw_settings,
     )
-    assert worker._lease_seconds >= 10
+    assert worker._lease_seconds >= 180
 
 

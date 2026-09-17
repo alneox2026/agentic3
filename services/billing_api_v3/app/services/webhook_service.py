@@ -1900,7 +1900,7 @@ class StripeWebhookService:
 
         # Atomically claim lease with lease_owner_token before calling Stripe
         lease_seconds = max(
-            10,
+            180,
             int(
                 getattr(
                     self._settings,
