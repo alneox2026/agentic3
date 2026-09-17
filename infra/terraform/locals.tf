@@ -74,6 +74,13 @@ locals {
     BILLING_RECONCILIATION_AUDIENCE                   = local.billing_reconciliation_audience
   }
 
+  gateway_secret_env = var.gemini_api_key_secret_id == "" ? {} : {
+    GEMINI_API_KEY = {
+      secret  = var.gemini_api_key_secret_id
+      version = var.gemini_api_key_secret_version
+    }
+  }
+
   # Pin a numbered secret version. Do not use latest for environment-variable
   # secrets because an existing Cloud Run instance resolves them at startup.
   billing_api_secret_env = merge(

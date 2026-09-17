@@ -408,6 +408,25 @@ variable "gateway_timeout" {
   default     = "300s"
 }
 
+variable "gemini_api_key_secret_id" {
+  description = "Existing Secret Manager secret ID containing the Google Gemini API key."
+  type        = string
+  default     = "gemini-api-key"
+}
+
+variable "gemini_api_key_secret_version" {
+  description = "Pinned numeric version of the Gemini API key Secret Manager secret."
+  type        = string
+  default     = "1"
+}
+
+variable "gemini_api_key" {
+  description = "Direct Gemini API key (optional fallback when Secret Manager is not used)."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "cloud_run_execution_environment" {
   description = "Pinned Cloud Run execution environment for both services."
   type        = string
