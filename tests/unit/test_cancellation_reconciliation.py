@@ -47,6 +47,12 @@ class FakeDocumentReference:
             self.client.documents[self.key] = {}
         self.client.documents[self.key].update(updates)
 
+    def set(self, data: dict[str, Any], merge: bool = False) -> None:
+        if merge and self.key in self.client.documents:
+            self.client.documents[self.key].update(data)
+        else:
+            self.client.documents[self.key] = dict(data)
+
 
 class FakeCollectionReference:
     def __init__(self, client: Any, collection: str) -> None:
@@ -648,5 +654,61 @@ def test_webhook_pending_cancellation_skips_when_reconciler_holds_lease() -> Non
     doc = client.documents[("subscription_cancellation_requests", "re_race_1")]
     assert doc["status"] == "pending"
     assert doc["lease_owner_token"] == "reconciler_token_123"
+
+
+def test_reconcile_migration_checkpoints_and_completes() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    client = FakeFirestore()
+
+    for i in range(5):
+        doc_id = f"re_legacy_{i:02d}"
+        client.documents[("subscription_cancellation_requests", doc_id)] = {
+            "schema_version": 1,
+            "cancellation_request_id": doc_id,
+            "billing_account_id": f"acc_{i}",
+            "status": "pending",
+            "attempts": 0,
+            "created_at": now - timedelta(hours=i + 1),
+            "updated_at": now - timedelta(hours=i + 1),
+        }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    migrated = service._backfill_missing_next_attempt_at(client, now)
+    assert migrated == 5
+
+    checkpoint = client.documents[("subscription_cancellation_requests", "__migration_checkpoint_next_attempt_at__")]
+    assert checkpoint["completed"] is True
+    assert checkpoint["migrated_count"] == 5
+    assert checkpoint["cursor"] == "re_legacy_04"
+    assert checkpoint["completed_at"] == now
+
+    # Verify each legacy doc was transactionally updated with its created_at
+    for i in range(5):
+        doc_id = f"re_legacy_{i:02d}"
+        d = client.documents[("subscription_cancellation_requests", doc_id)]
+        assert d["next_attempt_at"] == now - timedelta(hours=i + 1)
+
+    # Next run reads completed checkpoint and returns 0 immediately
+    migrated_second = service._backfill_missing_next_attempt_at(client, now)
+    assert migrated_second == 0
+
+
+def test_shared_lease_seconds_configured_in_settings() -> None:
+    settings = _settings()
+    assert settings.cancellation_lease_seconds == 180
+
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: FakeFirestore(),
+        stripe_gateway=FakeStripeGateway(),
+        settings=settings,
+    )
+    assert service._lease_seconds == 180
 
 

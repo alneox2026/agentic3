@@ -34,6 +34,7 @@ class BillingApiSettings:
     reconciliation_auth_required: bool = True
     reconciliation_audience: str = ""
     reconciliation_allowed_service_account: str = ""
+    cancellation_lease_seconds: int = 180
 
 
 def _parse_bool(value: str | None, default: bool = True) -> bool:
@@ -100,4 +101,7 @@ def get_settings() -> BillingApiSettings:
         reconciliation_allowed_service_account=os.getenv(
             "BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", ""
         ).strip(),
+        cancellation_lease_seconds=int(
+            os.getenv("BILLING_CANCELLATION_LEASE_SECONDS", "180")
+        ),
     )

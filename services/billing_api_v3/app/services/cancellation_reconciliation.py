@@ -63,7 +63,7 @@ class CancellationReconciliationService:
         settings: BillingApiSettings | None = None,
         transaction_runner: Callable[[Any, Callable[[Any], Any]], Any] | None = None,
         now_factory: Callable[[], datetime] | None = None,
-        lease_seconds: int = 180,
+        lease_seconds: int | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._firestore_client_factory = firestore_client_factory or (
@@ -72,7 +72,14 @@ class CancellationReconciliationService:
         self._stripe_gateway = stripe_gateway or get_stripe_gateway()
         self._transaction_runner = transaction_runner or _run_firestore_transaction
         self._now_factory = now_factory or (lambda: datetime.now(timezone.utc))
-        self._lease_seconds = max(10, lease_seconds)
+        default_lease = int(
+            getattr(
+                self._settings,
+                "cancellation_lease_seconds",
+                getattr(self._settings, "cancellation_reconciliation_lease_seconds", 180),
+            )
+        )
+        self._lease_seconds = max(10, lease_seconds if lease_seconds is not None else default_lease)
 
     async def reconcile_intents(self, *, batch_size: int = 50) -> CancellationReconciliationResult:
         return await asyncio.to_thread(self.reconcile_intents_sync, batch_size=batch_size)
@@ -105,7 +112,7 @@ class CancellationReconciliationService:
                 or getattr(intent_snapshot, "document_id", None)
                 or intent_data.get("cancellation_request_id")
             )
-            if not intent_id:
+            if not intent_id or str(intent_id).startswith("__"):
                 skipped += 1
                 continue
 
@@ -295,49 +302,138 @@ class CancellationReconciliationService:
         )
 
     def _backfill_missing_next_attempt_at(self, client: Any, now_ts: datetime) -> int:
-        """Populate missing next_attempt_at on legacy records so order_by query includes them."""
+        """Checkpointed, paginated migration ordered by document ID to populate missing next_attempt_at."""
         collection_name = getattr(
             self._settings,
             "subscription_cancellation_requests_collection",
             "subscription_cancellation_requests_v3",
         )
         coll = client.collection(collection_name)
-        backfilled = 0
-        try:
-            from google.cloud.firestore_v1.base_query import FieldFilter
+        checkpoint_ref = coll.document("__migration_checkpoint_next_attempt_at__")
+        checkpoint_snap = checkpoint_ref.get() if hasattr(checkpoint_ref, "get") else None
+        checkpoint_data = (
+            checkpoint_snap.to_dict()
+            if checkpoint_snap and getattr(checkpoint_snap, "exists", False) and hasattr(checkpoint_snap, "to_dict")
+            else {}
+        ) or {}
 
-            # Scan unresolved/pending documents WITHOUT order_by to discover legacy docs lacking the field
-            docs = list(
-                coll.where(filter=FieldFilter("status", "in", ["unresolved", "pending"]))
-                .limit(100)
-                .stream()
+        if checkpoint_data.get("completed") is True:
+            return 0
+
+        cursor = checkpoint_data.get("cursor")
+        total_migrated = int(checkpoint_data.get("migrated_count", 0))
+        page_size = 100
+        migrated_in_run = 0
+
+        def _doc_id(s: Any) -> str:
+            return (
+                getattr(s, "id", None)
+                or getattr(s, "document_id", None)
+                or ((s.to_dict() or {}).get("cancellation_request_id") if hasattr(s, "to_dict") else "")
+                or ""
             )
-        except (AttributeError, ModuleNotFoundError, ImportError):
-            docs = []
-            if hasattr(coll, "stream"):
-                docs = [
-                    s
-                    for s in coll.stream()
-                    if (s.to_dict() or {}).get("status") in ("unresolved", "pending")
-                ][:100]
 
-        for doc in docs:
-            data = doc.to_dict() or {}
-            if "next_attempt_at" not in data or data.get("next_attempt_at") is None:
-                doc_id = (
-                    getattr(doc, "id", None)
-                    or getattr(doc, "document_id", None)
-                    or data.get("cancellation_request_id")
-                )
-                if not doc_id:
+        while True:
+            try:
+                from google.cloud.firestore_v1 import FieldPath
+
+                doc_id_field = FieldPath.document_id()
+                query = coll.order_by(doc_id_field)
+                if cursor:
+                    cursor_ref = coll.document(cursor)
+                    cursor_snap = cursor_ref.get() if hasattr(cursor_ref, "get") else None
+                    if cursor_snap and getattr(cursor_snap, "exists", False):
+                        query = query.start_after(cursor_snap)
+                    else:
+                        query = query.start_after({doc_id_field: cursor})
+                query = query.limit(page_size)
+                docs = list(query.stream())
+            except (AttributeError, ModuleNotFoundError, ImportError):
+                docs = []
+                if hasattr(coll, "stream"):
+                    all_snaps = list(coll.stream())
+                    sorted_snaps = sorted(all_snaps, key=_doc_id)
+                    if cursor:
+                        sorted_snaps = [s for s in sorted_snaps if _doc_id(s) > cursor]
+                    docs = sorted_snaps[:page_size]
+
+            if not docs:
+                checkpoint_update = {
+                    "completed": True,
+                    "cursor": cursor,
+                    "migrated_count": total_migrated,
+                    "completed_at": now_ts,
+                    "updated_at": now_ts,
+                }
+                if hasattr(checkpoint_ref, "set"):
+                    checkpoint_ref.set(checkpoint_update, merge=True)
+                elif hasattr(checkpoint_ref, "update"):
+                    checkpoint_ref.update(checkpoint_update)
+                break
+
+            for doc in docs:
+                item_id = _doc_id(doc)
+                if not item_id or item_id.startswith("__"):
                     continue
-                target_time = data.get("created_at") or now_ts
-                doc_ref = coll.document(doc_id)
-                with suppress(Exception):
-                    doc_ref.update({"next_attempt_at": target_time, "updated_at": now_ts})
-                    backfilled += 1
 
-        return backfilled
+                cursor = item_id
+                data = (doc.to_dict() or {}) if hasattr(doc, "to_dict") else {}
+                if data.get("status") not in ("unresolved", "pending"):
+                    continue
+                if "next_attempt_at" in data and data.get("next_attempt_at") is not None:
+                    continue
+
+                doc_ref = coll.document(item_id)
+
+                def backfill_op(transaction: Any) -> bool:
+                    snap = get_transaction_document_snapshot(transaction, doc_ref)
+                    if not snap.exists:
+                        return False
+                    current_data = snap.to_dict() or {}
+                    if current_data.get("status") not in ("unresolved", "pending"):
+                        return False
+                    if "next_attempt_at" in current_data and current_data.get("next_attempt_at") is not None:
+                        return False
+                    target_time = current_data.get("created_at") or now_ts
+                    transaction.update(
+                        doc_ref,
+                        {
+                            "next_attempt_at": target_time,
+                            "updated_at": now_ts,
+                        },
+                    )
+                    return True
+
+                if self._transaction_runner(client, backfill_op):
+                    total_migrated += 1
+                    migrated_in_run += 1
+
+            if len(docs) < page_size:
+                checkpoint_update = {
+                    "completed": True,
+                    "cursor": cursor,
+                    "migrated_count": total_migrated,
+                    "completed_at": now_ts,
+                    "updated_at": now_ts,
+                }
+                if hasattr(checkpoint_ref, "set"):
+                    checkpoint_ref.set(checkpoint_update, merge=True)
+                elif hasattr(checkpoint_ref, "update"):
+                    checkpoint_ref.update(checkpoint_update)
+                break
+            else:
+                checkpoint_update = {
+                    "completed": False,
+                    "cursor": cursor,
+                    "migrated_count": total_migrated,
+                    "updated_at": now_ts,
+                }
+                if hasattr(checkpoint_ref, "set"):
+                    checkpoint_ref.set(checkpoint_update, merge=True)
+                elif hasattr(checkpoint_ref, "update"):
+                    checkpoint_ref.update(checkpoint_update)
+
+        return migrated_in_run
 
     def _pending_cancellation_intents(self, client: Any, limit: int) -> list[Any]:
         collection_name = getattr(
@@ -364,6 +460,7 @@ class CancellationReconciliationService:
                     s
                     for s in coll.stream()
                     if (s.to_dict() or {}).get("status") in ("unresolved", "pending")
+                    and not str(getattr(s, "id", "") or getattr(s, "document_id", "") or "").startswith("__")
                 ]
                 candidates.sort(key=_sort_key_next_attempt_at)
                 return candidates[:fetch_limit]
