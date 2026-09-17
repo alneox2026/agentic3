@@ -52,6 +52,8 @@ locals {
     WORKER_EVENTARC_AUDIENCE                = var.worker_eventarc_audience
   }
 
+  billing_reconciliation_audience = var.billing_api_reconciliation_audience != "" ? var.billing_api_reconciliation_audience : "https://${var.billing_api_service_name}-${var.project_id}.internal"
+
   billing_api_env = {
     GOOGLE_CLOUD_PROJECT                              = var.project_id
     GOOGLE_CLOUD_REGION                               = var.region
@@ -69,7 +71,7 @@ locals {
     FIRESTORE_STRIPE_WEBHOOK_EVENTS_COLLECTION        = var.firestore_stripe_webhook_events_collection
     BILLING_RECONCILIATION_REQUIRE_AUTH               = tostring(var.billing_api_require_reconciliation_auth)
     BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT    = var.billing_api_reconciliation_allowed_service_account != "" ? var.billing_api_reconciliation_allowed_service_account : google_service_account.billing_reconciler.email
-    BILLING_RECONCILIATION_AUDIENCE                   = var.billing_api_reconciliation_audience != "" ? var.billing_api_reconciliation_audience : google_cloud_run_v2_service.billing_api.uri
+    BILLING_RECONCILIATION_AUDIENCE                   = local.billing_reconciliation_audience
   }
 
   # Pin a numbered secret version. Do not use latest for environment-variable

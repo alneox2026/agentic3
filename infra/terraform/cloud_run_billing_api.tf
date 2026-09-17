@@ -10,6 +10,7 @@ resource "google_cloud_run_v2_service" "billing_api" {
     timeout                          = var.billing_api_timeout
     max_instance_request_concurrency = var.billing_api_concurrency
     execution_environment            = var.cloud_run_execution_environment
+    custom_audiences                 = [local.billing_reconciliation_audience]
 
     scaling {
       min_instance_count = var.billing_api_min_instances

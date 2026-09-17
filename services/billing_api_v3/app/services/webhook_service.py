@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import os
 from typing import Any
+import uuid
 
 from common.billing import (
     customer_billing_account_document_id,
@@ -1897,14 +1898,49 @@ class StripeWebhookService:
         cancel_refund_id = pending_cancellation["refund_id"]
         now_ts = _as_utc(self._now_factory())
 
+        # Atomically claim lease with lease_owner_token before calling Stripe
+        lease_expiry = now_ts + timedelta(seconds=180)
+        lease_token = uuid.uuid4().hex
+
+        def claim_lease_op(transaction: Any) -> bool:
+            cancellation_snapshot = get_transaction_document_snapshot(transaction, cancel_ref)
+            if not cancellation_snapshot.exists:
+                return False
+            data = cancellation_snapshot.to_dict() or {}
+            if data.get("status") not in ("pending", "unresolved"):
+                return False
+            active_lease = data.get("leased_until")
+            if active_lease and active_lease > now_ts:
+                return False
+            transaction.update(
+                cancel_ref,
+                {
+                    "leased_until": lease_expiry,
+                    "lease_owner_token": lease_token,
+                    "updated_at": now_ts,
+                },
+            )
+            return True
+
+        claimed = False
+        with suppress(Exception):
+            claimed = self._transaction_runner(client, claim_lease_op)
+
+        if not claimed:
+            # Another worker holds active lease or intent is already terminal; skip
+            return
+
         try:
             self._stripe_gateway.cancel_subscription(stripe_sub_id)
         except Exception as exc:
             def record_failure_op(transaction: Any) -> None:
                 cancellation_snapshot = get_transaction_document_snapshot(transaction, cancel_ref)
-                attempts = 1
-                if cancellation_snapshot.exists:
-                    attempts = int((cancellation_snapshot.to_dict() or {}).get("attempts", 0)) + 1
+                if not cancellation_snapshot.exists:
+                    return
+                current_data = cancellation_snapshot.to_dict() or {}
+                if current_data.get("lease_owner_token") != lease_token:
+                    return
+                attempts = int(current_data.get("attempts", 0)) + 1
                 backoff_seconds = min(3600, 30 * (2 ** min(attempts - 1, 6)))
                 next_attempt = now_ts + timedelta(seconds=backoff_seconds)
                 transaction.update(
@@ -1915,9 +1951,11 @@ class StripeWebhookService:
                         "last_error": str(exc),
                         "next_attempt_at": next_attempt,
                         "leased_until": None,
+                        "lease_owner_token": None,
                         "updated_at": now_ts,
                     },
                 )
+
             with suppress(Exception):
                 self._transaction_runner(client, record_failure_op)
 
@@ -1927,27 +1965,37 @@ class StripeWebhookService:
                 f"Failed to cancel Stripe subscription '{stripe_sub_id}' for refund '{cancel_refund_id}': {exc}",
             ) from exc
 
-        def finalize_cancellation_op(transaction: Any) -> None:
+        def finalize_cancellation_op(transaction: Any) -> bool:
+            snap = get_transaction_document_snapshot(transaction, cancel_ref)
+            if not snap.exists:
+                return False
+            current_data = snap.to_dict() or {}
+            if current_data.get("lease_owner_token") != lease_token:
+                return False
             transaction.update(
                 cancel_ref,
                 {
                     "status": "completed",
                     "completed_at": now_ts,
                     "leased_until": None,
+                    "lease_owner_token": None,
                     "updated_at": now_ts,
                 },
             )
-            transaction.update(
-                acc_ref,
-                {
-                    "subscription_status": "canceled",
-                    "stripe_subscription_status": "canceled",
-                    "subscription_canceled_at": now_ts,
-                    "subscription_cancellation_pending": False,
-                    "unresolved_cancellation_request_id": None,
-                    "updated_at": now_ts,
-                },
-            )
+            if acc_ref:
+                transaction.update(
+                    acc_ref,
+                    {
+                        "subscription_status": "canceled",
+                        "stripe_subscription_status": "canceled",
+                        "subscription_canceled_at": now_ts,
+                        "subscription_cancellation_pending": False,
+                        "unresolved_cancellation_request_id": None,
+                        "updated_at": now_ts,
+                    },
+                )
+            return True
+
         self._transaction_runner(client, finalize_cancellation_op)
 
     def _clear_active_checkout(

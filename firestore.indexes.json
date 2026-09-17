@@ -1,0 +1,19 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "subscription_cancellation_requests_v3",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "next_attempt_at",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

@@ -42,6 +42,11 @@ class FakeDocumentReference:
     def get(self) -> FakeSnapshot:
         return FakeSnapshot(self.client.documents.get(self.key), self.document_id)
 
+    def update(self, updates: dict[str, Any]) -> None:
+        if self.key not in self.client.documents:
+            self.client.documents[self.key] = {}
+        self.client.documents[self.key].update(updates)
+
 
 class FakeCollectionReference:
     def __init__(self, client: Any, collection: str) -> None:
@@ -534,5 +539,114 @@ def test_reconcile_fencing_token_prevents_stale_worker_finalization() -> None:
     doc = client.documents[("subscription_cancellation_requests", "re_stale_1")]
     assert doc["status"] == "pending"
     assert doc["lease_owner_token"] == "different_worker_token_abc"
+
+
+def test_reconcile_backfills_legacy_intents_missing_next_attempt_at() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_legacy_1",
+        "subscription_cancellation_pending": True,
+    }
+    # Legacy intent missing next_attempt_at entirely
+    client.documents[("subscription_cancellation_requests", "re_legacy_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_legacy_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_legacy_1",
+        "status": "pending",
+        "attempts": 0,
+        "created_at": now - timedelta(minutes=5),
+        "updated_at": now - timedelta(minutes=5),
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    assert result.completed_cancellations == 1
+    assert "sub_legacy_1" in stripe.cancelled_subscriptions
+    doc = client.documents[("subscription_cancellation_requests", "re_legacy_1")]
+    assert doc["status"] == "completed"
+    assert doc.get("next_attempt_at") == now - timedelta(minutes=5)
+
+
+def test_webhook_pending_cancellation_skips_when_reconciler_holds_lease() -> None:
+    from services.billing_api_v3.app.services.webhook_service import StripeWebhookService
+
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_race_1",
+        "subscription_cancellation_pending": True,
+    }
+    # Intent already leased by reconciler worker
+    client.documents[("subscription_cancellation_requests", "re_race_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_race_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_race_1",
+        "status": "pending",
+        "leased_until": now + timedelta(seconds=120),
+        "lease_owner_token": "reconciler_token_123",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    cancel_ref = client.collection("subscription_cancellation_requests").document("re_race_1")
+    acc_ref = client.collection("customer_billing_accounts").document(account_id)
+
+    webhook_svc = StripeWebhookService(
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+        firestore_client_factory=lambda: client,
+        transaction_runner=lambda cl, op: op(cl.transaction()),
+    )
+
+    webhook_svc._execute_pending_cancellation(
+        client,
+        {
+            "stripe_subscription_id": "sub_race_1",
+            "cancellation_ref": cancel_ref,
+            "account_ref": acc_ref,
+            "refund_id": "re_race_1",
+        },
+    )
+
+    # Webhook execution should skip because reconciler holds the lease
+    assert stripe.cancelled_subscriptions == []
+    doc = client.documents[("subscription_cancellation_requests", "re_race_1")]
+    assert doc["status"] == "pending"
+    assert doc["lease_owner_token"] == "reconciler_token_123"
 
 

@@ -59,7 +59,7 @@ resource "google_cloud_scheduler_job" "cancellation_reconciliation" {
 
     oidc_token {
       service_account_email = google_service_account.billing_reconciler.email
-      audience              = var.billing_api_reconciliation_audience != "" ? var.billing_api_reconciliation_audience : google_cloud_run_v2_service.billing_api.uri
+      audience              = local.billing_reconciliation_audience
     }
   }
 
@@ -68,5 +68,21 @@ resource "google_cloud_scheduler_job" "cancellation_reconciliation" {
     google_cloud_run_v2_service.billing_api,
     google_cloud_run_v2_service_iam_member.billing_api_billing_reconciler_invoker,
   ]
+}
+
+resource "google_firestore_index" "subscription_cancellation_requests_status_next_attempt" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = var.firestore_subscription_cancellation_requests_collection
+
+  fields {
+    field_path = "status"
+    order      = "ASCENDING"
+  }
+
+  fields {
+    field_path = "next_attempt_at"
+    order      = "ASCENDING"
+  }
 }
 

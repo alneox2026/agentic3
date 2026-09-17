@@ -529,9 +529,15 @@ variable "billing_api_reconciliation_allowed_service_account" {
 }
 
 variable "billing_api_reconciliation_audience" {
-  description = "Expected OIDC audience for reconciliation requests when application-level auth is enabled. Defaults to the Billing API Cloud Run service URL when empty."
+  description = "Expected OIDC audience for reconciliation requests when application-level auth is enabled. Defaults to https://{service}-{project}.internal when empty."
   type        = string
   default     = ""
+}
+
+variable "firestore_subscription_cancellation_requests_collection" {
+  description = "Top-level private Firestore collection for subscription cancellation intents."
+  type        = string
+  default     = "subscription_cancellation_requests_v3"
 }
 
 variable "alert_notification_channels" {
