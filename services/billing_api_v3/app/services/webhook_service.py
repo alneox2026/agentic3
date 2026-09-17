@@ -356,18 +356,60 @@ class StripeWebhookService:
         )
         processed_at = _as_utc(self._now_factory())
 
-        def operation(transaction: Any) -> WebhookResult:
+        def operation(transaction: Any) -> tuple[WebhookResult, dict[str, Any] | None]:
             # Keep every read before the first write. Firestore retries this
             # function on concurrent changes, preserving financial correctness.
             event_snapshot = get_transaction_document_snapshot(transaction, event_ref)
             account_snapshot = get_transaction_document_snapshot(transaction, account_ref)
             transaction_snapshot = get_transaction_document_snapshot(transaction, transaction_ref)
+
+            unresolved_id = None
+            unresolved_cancel_ref = None
+            unresolved_cancel_snapshot = None
+            if account_snapshot.exists:
+                account_temp = account_snapshot.to_dict() or {}
+                unresolved_id = account_temp.get("unresolved_cancellation_request_id")
+                if unresolved_id:
+                    cancellation_collection_name = getattr(
+                        self._settings,
+                        "subscription_cancellation_requests_collection",
+                        "subscription_cancellation_requests_v3",
+                    )
+                    unresolved_cancel_ref = client.collection(cancellation_collection_name).document(unresolved_id)
+                    unresolved_cancel_snapshot = get_transaction_document_snapshot(transaction, unresolved_cancel_ref)
+
             if event_snapshot.exists:
-                return WebhookResult(
-                    stripe_event_id=fulfillment.stripe_event_id,
-                    stripe_event_type=fulfillment.stripe_event_type,
-                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
-                    duplicate=True,
+                if (
+                    unresolved_cancel_ref is not None
+                    and unresolved_cancel_snapshot is not None
+                    and unresolved_cancel_snapshot.exists
+                ):
+                    cancel_data = unresolved_cancel_snapshot.to_dict() or {}
+                    if cancel_data.get("status") in ("pending", "unresolved"):
+                        sub_id = cancel_data.get("stripe_subscription_id") or fulfillment.stripe_subscription_id
+                        if sub_id:
+                            return (
+                                WebhookResult(
+                                    stripe_event_id=fulfillment.stripe_event_id,
+                                    stripe_event_type=fulfillment.stripe_event_type,
+                                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "topup_credited")),
+                                    duplicate=True,
+                                ),
+                                {
+                                    "cancellation_ref": unresolved_cancel_ref,
+                                    "account_ref": account_ref,
+                                    "stripe_subscription_id": sub_id,
+                                    "refund_id": unresolved_id,
+                                },
+                            )
+                return (
+                    WebhookResult(
+                        stripe_event_id=fulfillment.stripe_event_id,
+                        stripe_event_type=fulfillment.stripe_event_type,
+                        outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
+                        duplicate=True,
+                    ),
+                    None,
                 )
             if not account_snapshot.exists:
                 raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
@@ -392,11 +434,30 @@ class StripeWebhookService:
                     owner_uid=owner_uid,
                     wallet_transaction_id=transaction_id,
                 )
-                return WebhookResult(
-                    stripe_event_id=fulfillment.stripe_event_id,
-                    stripe_event_type=fulfillment.stripe_event_type,
-                    outcome="topup_credited",
-                    duplicate=True,
+                pending_cancel: dict[str, Any] | None = None
+                if (
+                    unresolved_cancel_ref is not None
+                    and unresolved_cancel_snapshot is not None
+                    and unresolved_cancel_snapshot.exists
+                ):
+                    cancel_data = unresolved_cancel_snapshot.to_dict() or {}
+                    if cancel_data.get("status") in ("pending", "unresolved"):
+                        sub_id = cancel_data.get("stripe_subscription_id") or fulfillment.stripe_subscription_id
+                        if sub_id:
+                            pending_cancel = {
+                                "cancellation_ref": unresolved_cancel_ref,
+                                "account_ref": account_ref,
+                                "stripe_subscription_id": sub_id,
+                                "refund_id": unresolved_id,
+                            }
+                return (
+                    WebhookResult(
+                        stripe_event_id=fulfillment.stripe_event_id,
+                        stripe_event_type=fulfillment.stripe_event_type,
+                        outcome="topup_credited",
+                        duplicate=True,
+                    ),
+                    pending_cancel,
                 )
 
             wallet = wallet_snapshot.to_dict() or {}
@@ -471,6 +532,30 @@ class StripeWebhookService:
                     "created_at": processed_at,
                 },
             )
+            pending_cancellation: dict[str, Any] | None = None
+            if (
+                unresolved_cancel_ref is not None
+                and unresolved_cancel_snapshot is not None
+                and unresolved_cancel_snapshot.exists
+                and fulfillment.stripe_subscription_id
+            ):
+                cancel_data = unresolved_cancel_snapshot.to_dict() or {}
+                if cancel_data.get("status") in ("unresolved", "pending"):
+                    transaction.update(
+                        unresolved_cancel_ref,
+                        {
+                            "stripe_subscription_id": fulfillment.stripe_subscription_id,
+                            "status": "pending",
+                            "updated_at": processed_at,
+                        },
+                    )
+                    pending_cancellation = {
+                        "cancellation_ref": unresolved_cancel_ref,
+                        "account_ref": account_ref,
+                        "stripe_subscription_id": fulfillment.stripe_subscription_id,
+                        "refund_id": unresolved_id,
+                    }
+
             self._clear_active_checkout(
                 transaction=transaction,
                 account_ref=account_ref,
@@ -488,14 +573,20 @@ class StripeWebhookService:
                 owner_uid=owner_uid,
                 wallet_transaction_id=transaction_id,
             )
-            return WebhookResult(
-                stripe_event_id=fulfillment.stripe_event_id,
-                stripe_event_type=fulfillment.stripe_event_type,
-                outcome="topup_credited",
-                duplicate=False,
+            return (
+                WebhookResult(
+                    stripe_event_id=fulfillment.stripe_event_id,
+                    stripe_event_type=fulfillment.stripe_event_type,
+                    outcome="topup_credited",
+                    duplicate=False,
+                ),
+                pending_cancellation,
             )
 
-        return self._transaction_runner(client, operation)
+        result, pending_cancellation = self._transaction_runner(client, operation)
+        if pending_cancellation and pending_cancellation.get("stripe_subscription_id"):
+            self._execute_pending_cancellation(client, pending_cancellation)
+        return result
 
     def _handle_invoice_paid(
         self,
@@ -862,15 +953,57 @@ class StripeWebhookService:
         )
         processed_at = _as_utc(self._now_factory())
 
-        def operation(transaction: Any) -> WebhookResult:
+        def operation(transaction: Any) -> tuple[WebhookResult, dict[str, Any] | None]:
             event_snapshot = get_transaction_document_snapshot(transaction, event_ref)
             account_snapshot = get_transaction_document_snapshot(transaction, account_ref)
+
+            unresolved_id = None
+            unresolved_cancel_ref = None
+            unresolved_cancel_snapshot = None
+            if account_snapshot.exists:
+                account_temp = account_snapshot.to_dict() or {}
+                unresolved_id = account_temp.get("unresolved_cancellation_request_id")
+                if unresolved_id:
+                    cancellation_collection_name = getattr(
+                        self._settings,
+                        "subscription_cancellation_requests_collection",
+                        "subscription_cancellation_requests_v3",
+                    )
+                    unresolved_cancel_ref = client.collection(cancellation_collection_name).document(unresolved_id)
+                    unresolved_cancel_snapshot = get_transaction_document_snapshot(transaction, unresolved_cancel_ref)
+
             if event_snapshot.exists:
-                return WebhookResult(
-                    stripe_event_id=stripe_event_id,
-                    stripe_event_type=stripe_event_type,
-                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
-                    duplicate=True,
+                if (
+                    unresolved_cancel_ref is not None
+                    and unresolved_cancel_snapshot is not None
+                    and unresolved_cancel_snapshot.exists
+                ):
+                    cancel_data = unresolved_cancel_snapshot.to_dict() or {}
+                    if cancel_data.get("status") in ("pending", "unresolved"):
+                        sub_id = cancel_data.get("stripe_subscription_id") or stripe_subscription_id
+                        if sub_id:
+                            return (
+                                WebhookResult(
+                                    stripe_event_id=stripe_event_id,
+                                    stripe_event_type=stripe_event_type,
+                                    outcome=str((event_snapshot.to_dict() or {}).get("outcome", "subscription_state_updated")),
+                                    duplicate=True,
+                                ),
+                                {
+                                    "cancellation_ref": unresolved_cancel_ref,
+                                    "account_ref": account_ref,
+                                    "stripe_subscription_id": sub_id,
+                                    "refund_id": unresolved_id,
+                                },
+                            )
+                return (
+                    WebhookResult(
+                        stripe_event_id=stripe_event_id,
+                        stripe_event_type=stripe_event_type,
+                        outcome=str((event_snapshot.to_dict() or {}).get("outcome", "ignored")),
+                        duplicate=True,
+                    ),
+                    None,
                 )
             if not account_snapshot.exists:
                 raise BillingApiError(400, "billing_account_missing", "Stripe event has no billing account.")
@@ -880,6 +1013,7 @@ class StripeWebhookService:
                 billing_account_id=billing_account_id,
                 stripe_customer_id=stripe_customer_id,
             )
+
             account_updates = {
                 "stripe_customer_id": stripe_customer_id,
                 "stripe_customer_status": "ready",
@@ -892,6 +1026,31 @@ class StripeWebhookService:
             if last_invoice_id:
                 account_updates["last_service_fee_invoice_id"] = last_invoice_id
             transaction.update(account_ref, account_updates)
+
+            pending_cancellation: dict[str, Any] | None = None
+            if (
+                unresolved_cancel_ref is not None
+                and unresolved_cancel_snapshot is not None
+                and unresolved_cancel_snapshot.exists
+                and stripe_subscription_id
+            ):
+                cancel_data = unresolved_cancel_snapshot.to_dict() or {}
+                if cancel_data.get("status") in ("unresolved", "pending"):
+                    transaction.update(
+                        unresolved_cancel_ref,
+                        {
+                            "stripe_subscription_id": stripe_subscription_id,
+                            "status": "pending",
+                            "updated_at": processed_at,
+                        },
+                    )
+                    pending_cancellation = {
+                        "cancellation_ref": unresolved_cancel_ref,
+                        "account_ref": account_ref,
+                        "stripe_subscription_id": stripe_subscription_id,
+                        "refund_id": unresolved_id,
+                    }
+
             transaction.create(
                 event_ref,
                 build_stripe_webhook_event_document(
@@ -911,14 +1070,20 @@ class StripeWebhookService:
                     stripe_subscription_id=stripe_subscription_id,
                 ),
             )
-            return WebhookResult(
-                stripe_event_id=stripe_event_id,
-                stripe_event_type=stripe_event_type,
-                outcome="subscription_state_updated",
-                duplicate=False,
+            return (
+                WebhookResult(
+                    stripe_event_id=stripe_event_id,
+                    stripe_event_type=stripe_event_type,
+                    outcome="subscription_state_updated",
+                    duplicate=False,
+                ),
+                pending_cancellation,
             )
 
-        return self._transaction_runner(client, operation)
+        result, pending_cancellation = self._transaction_runner(client, operation)
+        if pending_cancellation and pending_cancellation.get("stripe_subscription_id"):
+            self._execute_pending_cancellation(client, pending_cancellation)
+        return result
 
     def _handle_refund_created(
         self,
@@ -1041,8 +1206,15 @@ class StripeWebhookService:
                     cancellation_snapshot = get_transaction_document_snapshot(transaction, cancellation_ref)
                     if cancellation_snapshot.exists:
                         cancellation_data = cancellation_snapshot.to_dict() or {}
-                        if cancellation_data.get("status") == "pending":
-                            stripe_sub_id = cancellation_data.get("stripe_subscription_id")
+                        if cancellation_data.get("status") in ("pending", "unresolved"):
+                            account_data = account_snapshot.to_dict() or {} if account_snapshot.exists else {}
+                            stripe_sub_id = cancellation_data.get("stripe_subscription_id") or account_data.get("stripe_subscription_id")
+                            if not stripe_sub_id and charge.get("invoice"):
+                                try:
+                                    inv = self._stripe_gateway.retrieve_invoice(charge["invoice"])
+                                    stripe_sub_id = _optional_id(inv.get("subscription"))
+                                except Exception:
+                                    stripe_sub_id = None
                             if stripe_sub_id:
                                 return (
                                     WebhookResult(
@@ -1132,30 +1304,38 @@ class StripeWebhookService:
             pending_cancellation: dict[str, Any] | None = None
             if is_combined_charge and amount_refunded_cents >= amount_cents and cancellation_ref is not None:
                 stripe_sub_id = account.get("stripe_subscription_id")
-                if stripe_sub_id:
-                    if cancellation_snapshot is None or not cancellation_snapshot.exists:
-                        transaction.create(
-                            cancellation_ref,
-                            {
-                                "schema_version": 1,
-                                "cancellation_request_id": refund_id,
-                                "stripe_subscription_id": stripe_sub_id,
-                                "billing_account_id": billing_account_id,
-                                "billing_subject_id": owner_uid,
-                                "owner_uid": owner_uid,
-                                "status": "pending",
-                                "created_at": processed_at,
-                                "updated_at": processed_at,
-                                "attempts": 0,
-                            },
-                        )
-                    transaction.update(
-                        account_ref,
+                if not stripe_sub_id and charge.get("invoice"):
+                    try:
+                        inv = self._stripe_gateway.retrieve_invoice(charge["invoice"])
+                        stripe_sub_id = _optional_id(inv.get("subscription"))
+                    except Exception:
+                        stripe_sub_id = None
+
+                if cancellation_snapshot is None or not cancellation_snapshot.exists:
+                    transaction.create(
+                        cancellation_ref,
                         {
-                            "subscription_cancellation_pending": True,
+                            "schema_version": 1,
+                            "cancellation_request_id": refund_id,
+                            "stripe_subscription_id": stripe_sub_id,
+                            "billing_account_id": billing_account_id,
+                            "billing_subject_id": owner_uid,
+                            "owner_uid": owner_uid,
+                            "status": "pending" if stripe_sub_id else "unresolved",
+                            "created_at": processed_at,
                             "updated_at": processed_at,
+                            "attempts": 0,
                         },
                     )
+                transaction.update(
+                    account_ref,
+                    {
+                        "subscription_cancellation_pending": True,
+                        "unresolved_cancellation_request_id": refund_id if not stripe_sub_id else None,
+                        "updated_at": processed_at,
+                    },
+                )
+                if stripe_sub_id:
                     pending_cancellation = {
                         "cancellation_ref": cancellation_ref,
                         "account_ref": account_ref,
@@ -1224,57 +1404,7 @@ class StripeWebhookService:
         result, pending_cancellation = self._transaction_runner(client, operation)
 
         if pending_cancellation and pending_cancellation.get("stripe_subscription_id"):
-            stripe_sub_id = pending_cancellation["stripe_subscription_id"]
-            cancel_ref = pending_cancellation["cancellation_ref"]
-            acc_ref = pending_cancellation["account_ref"]
-            cancel_refund_id = pending_cancellation["refund_id"]
-            now_ts = _as_utc(self._now_factory())
-
-            try:
-                self._stripe_gateway.cancel_subscription(stripe_sub_id)
-            except Exception as exc:
-                def record_failure_op(transaction: Any) -> None:
-                    cancellation_snapshot = get_transaction_document_snapshot(transaction, cancel_ref)
-                    attempts = 1
-                    if cancellation_snapshot.exists:
-                        attempts = int((cancellation_snapshot.to_dict() or {}).get("attempts", 0)) + 1
-                    transaction.update(
-                        cancel_ref,
-                        {
-                            "status": "pending",
-                            "attempts": attempts,
-                            "last_error": str(exc),
-                            "updated_at": now_ts,
-                        },
-                    )
-                with suppress(Exception):
-                    self._transaction_runner(client, record_failure_op)
-
-                raise BillingApiError(
-                    502,
-                    "stripe_subscription_cancellation_failed",
-                    f"Failed to cancel Stripe subscription '{stripe_sub_id}' for refund '{cancel_refund_id}': {exc}",
-                ) from exc
-
-            def finalize_cancellation_op(transaction: Any) -> None:
-                transaction.update(
-                    cancel_ref,
-                    {
-                        "status": "completed",
-                        "completed_at": now_ts,
-                        "updated_at": now_ts,
-                    },
-                )
-                transaction.update(
-                    acc_ref,
-                    {
-                        "subscription_status": "canceled",
-                        "subscription_canceled_at": now_ts,
-                        "subscription_cancellation_pending": False,
-                        "updated_at": now_ts,
-                    },
-                )
-            self._transaction_runner(client, finalize_cancellation_op)
+            self._execute_pending_cancellation(client, pending_cancellation)
 
         return result
 
@@ -1715,6 +1845,65 @@ class StripeWebhookService:
                 **updates,
             },
         )
+
+    def _execute_pending_cancellation(
+        self,
+        client: Any,
+        pending_cancellation: dict[str, Any],
+    ) -> None:
+        stripe_sub_id = pending_cancellation["stripe_subscription_id"]
+        cancel_ref = pending_cancellation["cancellation_ref"]
+        acc_ref = pending_cancellation["account_ref"]
+        cancel_refund_id = pending_cancellation["refund_id"]
+        now_ts = _as_utc(self._now_factory())
+
+        try:
+            self._stripe_gateway.cancel_subscription(stripe_sub_id)
+        except Exception as exc:
+            def record_failure_op(transaction: Any) -> None:
+                cancellation_snapshot = get_transaction_document_snapshot(transaction, cancel_ref)
+                attempts = 1
+                if cancellation_snapshot.exists:
+                    attempts = int((cancellation_snapshot.to_dict() or {}).get("attempts", 0)) + 1
+                transaction.update(
+                    cancel_ref,
+                    {
+                        "status": "pending",
+                        "attempts": attempts,
+                        "last_error": str(exc),
+                        "updated_at": now_ts,
+                    },
+                )
+            with suppress(Exception):
+                self._transaction_runner(client, record_failure_op)
+
+            raise BillingApiError(
+                502,
+                "stripe_subscription_cancellation_failed",
+                f"Failed to cancel Stripe subscription '{stripe_sub_id}' for refund '{cancel_refund_id}': {exc}",
+            ) from exc
+
+        def finalize_cancellation_op(transaction: Any) -> None:
+            transaction.update(
+                cancel_ref,
+                {
+                    "status": "completed",
+                    "completed_at": now_ts,
+                    "updated_at": now_ts,
+                },
+            )
+            transaction.update(
+                acc_ref,
+                {
+                    "subscription_status": "canceled",
+                    "stripe_subscription_status": "canceled",
+                    "subscription_canceled_at": now_ts,
+                    "subscription_cancellation_pending": False,
+                    "unresolved_cancellation_request_id": None,
+                    "updated_at": now_ts,
+                },
+            )
+        self._transaction_runner(client, finalize_cancellation_op)
 
     def _clear_active_checkout(
         self,

@@ -95,6 +95,8 @@ def build_initial_billing_account_document(
         "active_checkout_topup_package_id": None,
         "active_checkout_created_at": None,
         "active_checkout_expires_at": None,
+        "subscription_cancellation_pending": False,
+        "unresolved_cancellation_request_id": None,
         "created_at": created_at,
         "updated_at": created_at,
     }

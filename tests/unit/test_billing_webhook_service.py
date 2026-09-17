@@ -1401,5 +1401,310 @@ def test_refund_created_full_combined_topup_cancellation_failure_preserves_pendi
     assert cancellation_req["status"] == "completed"
 
 
+def test_refund_created_before_checkout_session_creates_unresolved_intent_and_later_cancels():
+    """If refund.created arrives before checkout.session.completed, it stores an unresolved intent
+
+    which is subsequently resolved and cancelled once checkout.session.completed delivers the subscription ID.
+    """
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    # 1. Full refund arrives before checkout.session.completed has populated stripe_subscription_id
+    refund_event = {
+        "id": "evt_refund_before_checkout",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_early_refund",
+                "charge": "ch_early_charge",
+                "amount": 1000,
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_early_charge",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "package_500",
+            "catalog_environment": "test",
+        },
+    }
+
+    # 2. Later, checkout.session.completed arrives with the subscription ID
+    topup_event = {
+        "id": "evt_topup_after_refund",
+        "type": "checkout.session.completed",
+        "created": 1786492810,
+        "livemode": False,
+        "data": {"object": {"id": "cs_late_topup"}},
+    }
+    checkout_session = {
+        "id": "cs_late_topup",
+        "livemode": False,
+        "mode": "subscription",
+        "payment_status": "paid",
+        "customer": "cus_test_123",
+        "subscription": "sub_late_123",
+        "metadata": {
+            "billing_account_id": account_id,
+            "catalog_environment": "test",
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "credit_5_usd",
+        },
+        "line_items": {
+            "data": [
+                {"price": "price_1U3ZHnB5Es3VU3maoEQbMKnC", "quantity": 1},
+                {"price": "price_1U3ZYBB5Es3VU3maSP6qq6sg", "quantity": 1},
+            ]
+        },
+    }
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    # Account starts with NO stripe_subscription_id
+    assert client.documents[("customer_billing_accounts", account_id)].get("stripe_subscription_id") is None
+
+    stripe = FakeStripeGateway(
+        events={
+            b"early_refund_payload": refund_event,
+            b"late_topup_payload": topup_event,
+        },
+        checkout_sessions={"cs_late_topup": checkout_session},
+        invoices={},
+        subscriptions={"sub_late_123": {"id": "sub_late_123", "status": "active"}},
+        charges={"ch_early_charge": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    # Step 1: Process early refund.created
+    refund_result = service.handle_sync(raw_payload=b"early_refund_payload", stripe_signature="signature")
+    assert refund_result.outcome == "charge_refunded"
+
+    # Cancellation cannot happen yet without subscription ID:
+    assert getattr(stripe, "cancelled_subscriptions", []) == []
+
+    # Unresolved cancellation intent must be durably recorded:
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_early_refund")]
+    assert cancellation_req["status"] == "unresolved"
+    assert cancellation_req["stripe_subscription_id"] is None
+
+    # Billing account reflects pending cancellation with unresolved request id:
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_cancellation_pending"] is True
+    assert account["unresolved_cancellation_request_id"] == "re_early_refund"
+
+    # Step 2: Now checkout.session.completed arrives with the subscription ID
+    topup_result = service.handle_sync(raw_payload=b"late_topup_payload", stripe_signature="signature")
+    assert topup_result.outcome == "topup_credited"
+
+    # The unresolved intent must be resolved and executed:
+    assert "sub_late_123" in getattr(stripe, "cancelled_subscriptions", [])
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_early_refund")]
+    assert cancellation_req["status"] == "completed"
+    assert cancellation_req["stripe_subscription_id"] == "sub_late_123"
+
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["stripe_subscription_status"] == "canceled"
+    assert account["subscription_cancellation_pending"] is False
+    assert account["unresolved_cancellation_request_id"] is None
+
+
+def test_refund_created_cancellation_idempotent_when_stripe_already_canceled():
+    """Cancellation is strictly idempotent: if Stripe indicates subscription is already canceled,
+
+    the gateway treats it as success and the local cancellation intent completes without raising 502.
+    """
+    from unittest.mock import MagicMock
+    from services.billing_api_v3.app.services.stripe_gateway import StripeSdkGateway
+
+    # 1. Direct unit test of StripeSdkGateway.cancel_subscription idempotency
+    gateway = StripeSdkGateway.__new__(StripeSdkGateway)
+    gateway._client = MagicMock()
+    gateway._client.v1.subscriptions.cancel.side_effect = Exception(
+        "Invalid request: This subscription has already been canceled."
+    )
+    result = gateway.cancel_subscription("sub_already_canceled_123")
+    assert result["id"] == "sub_already_canceled_123"
+    assert result["status"] == "canceled"
+
+    # 2. End-to-end webhook test: re-delivery / retry after cancellation already succeeded in Stripe
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    refund_event = {
+        "id": "evt_idempotent_cancel",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_idempotent_cancel",
+                "charge": "ch_idempotent_cancel",
+                "amount": 1000,
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_idempotent_cancel",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "package_500",
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_billing_accounts", account_id)]["stripe_subscription_id"] = "sub_already_canc"
+    client.documents[("customer_billing_accounts", account_id)]["subscription_cancellation_pending"] = True
+    client.documents[("subscription_cancellation_requests", "re_idempotent_cancel")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_idempotent_cancel",
+        "stripe_subscription_id": "sub_already_canc",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "status": "pending",
+        "attempts": 1,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"idempotent_cancel_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={"sub_already_canc": {"id": "sub_already_canc", "status": "canceled"}},
+        charges={"ch_idempotent_cancel": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    retry_res = service.handle_sync(raw_payload=b"idempotent_cancel_payload", stripe_signature="signature")
+    assert retry_res.outcome == "charge_refunded"
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_idempotent_cancel")]
+    assert cancellation_req["status"] == "completed"
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["subscription_cancellation_pending"] is False
+
+
+def test_refund_created_before_subscription_updated_creates_unresolved_intent_and_later_cancels():
+    """If refund.created arrives before customer.subscription.updated, the unresolved intent
+
+    is resolved and cancelled once customer.subscription.updated delivers the subscription ID.
+    """
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    refund_event = {
+        "id": "evt_refund_before_sub_updated",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_early_refund_sub",
+                "charge": "ch_early_charge_sub",
+                "amount": 1000,
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_early_charge_sub",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "package_500",
+            "catalog_environment": "test",
+        },
+    }
+
+    sub_event = {
+        "id": "evt_sub_after_refund",
+        "type": "customer.subscription.updated",
+        "created": 1786492810,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "sub_late_from_event",
+                "status": "active",
+                "customer": "cus_test_123",
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    }
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+
+    stripe = FakeStripeGateway(
+        events={
+            b"early_refund_payload_sub": refund_event,
+            b"late_sub_payload": sub_event,
+        },
+        checkout_sessions={},
+        invoices={},
+        subscriptions={
+            "sub_late_from_event": {
+                "id": "sub_late_from_event",
+                "status": "active",
+                "livemode": False,
+                "customer": "cus_test_123",
+                "current_period_start": 1786492800,
+                "current_period_end": 1789171200,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+        charges={"ch_early_charge_sub": charge_obj},
+    )
+    service = _service(client, stripe, now)
+
+    # 1. Process refund first
+    refund_result = service.handle_sync(raw_payload=b"early_refund_payload_sub", stripe_signature="signature")
+    assert refund_result.outcome == "charge_refunded"
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_early_refund_sub")]
+    assert cancellation_req["status"] == "unresolved"
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_cancellation_pending"] is True
+    assert account["unresolved_cancellation_request_id"] == "re_early_refund_sub"
+
+    # 2. Process subscription update later
+    sub_result = service.handle_sync(raw_payload=b"late_sub_payload", stripe_signature="signature")
+    assert sub_result.outcome == "subscription_state_updated"
+
+    # Intent must now be executed and completed
+    assert "sub_late_from_event" in getattr(stripe, "cancelled_subscriptions", [])
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_early_refund_sub")]
+    assert cancellation_req["status"] == "completed"
+    assert cancellation_req["stripe_subscription_id"] == "sub_late_from_event"
+
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["subscription_cancellation_pending"] is False
+    assert account["unresolved_cancellation_request_id"] is None
+
+
+
+
 
 

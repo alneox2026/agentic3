@@ -152,6 +152,9 @@ class StripeSdkGateway:
                 self._client.v1.subscriptions.cancel(subscription_id)
             )
         except Exception as exc:
+            err_msg = str(exc).lower()
+            if "already been canceled" in err_msg or "already canceled" in err_msg:
+                return {"id": subscription_id, "status": "canceled"}
             raise StripeGatewayError("Stripe subscription cancellation failed.") from exc
 
     def retrieve_charge(self, charge_id: str) -> Mapping[str, Any]:
