@@ -30,6 +30,7 @@ class BillingApiSettings:
     checkout_cancel_url: str
     checkout_session_ttl_seconds: int
     stripe_webhook_tolerance_seconds: int
+    subscription_cancellation_requests_collection: str = "subscription_cancellation_requests_v3"
 
 
 @lru_cache(maxsize=1)
@@ -78,4 +79,9 @@ def get_settings() -> BillingApiSettings:
         stripe_webhook_tolerance_seconds=int(
             os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300")
         ),
+        subscription_cancellation_requests_collection=os.getenv(
+            "FIRESTORE_SUBSCRIPTION_CANCELLATION_REQUESTS_COLLECTION",
+            "subscription_cancellation_requests_v3",
+        ).strip()
+        or "subscription_cancellation_requests_v3",
     )

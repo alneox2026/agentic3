@@ -105,6 +105,8 @@ class FakeStripeGateway:
         return self.charges[charge_id]
 
     def cancel_subscription(self, subscription_id):
+        if getattr(self, "cancel_error", None):
+            raise self.cancel_error
         if not hasattr(self, "cancelled_subscriptions"):
             self.cancelled_subscriptions = []
         self.cancelled_subscriptions.append(subscription_id)
@@ -134,6 +136,7 @@ def _settings() -> BillingApiSettings:
         checkout_cancel_url="https://example.test/cancelled",
         checkout_session_ttl_seconds=1800,
         stripe_webhook_tolerance_seconds=300,
+        subscription_cancellation_requests_collection="subscription_cancellation_requests",
     )
 
 
@@ -1306,6 +1309,97 @@ def test_refund_created_full_combined_topup_cancels_subscription():
     assert "sub_combined_123" in getattr(stripe, "cancelled_subscriptions", [])
     account = client.documents[("customer_billing_accounts", account_id)]
     assert account["subscription_status"] == "canceled"
+    assert account["subscription_cancellation_pending"] is False
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_combined_cancel")]
+    assert cancellation_req["status"] == "completed"
+
+
+def test_refund_created_full_combined_topup_cancellation_failure_preserves_pending_intent():
+    """If Stripe cancel_subscription fails, account is NOT marked canceled, intent stays pending, and 502 is raised."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+    wallet_id = customer_wallet_document_id("user-1")
+    refund_event = {
+        "id": "evt_combined_cancel_fail",
+        "type": "refund.created",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "re_combined_cancel_fail",
+                "charge": "ch_combined_cancel_fail",
+                "amount": 1000,
+                "metadata": {},
+            }
+        },
+    }
+    charge_obj = {
+        "id": "ch_combined_cancel_fail",
+        "customer": "cus_test_123",
+        "amount": 1000,
+        "amount_refunded": 1000,
+        "metadata": {
+            "billing_account_id": account_id,
+            "checkout_kind": "initial_subscription_topup",
+            "topup_package_id": "package_500",
+            "catalog_environment": "test",
+        },
+    }
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_billing_accounts", account_id)]["stripe_subscription_id"] = "sub_combined_fail"
+    client.documents[("customer_billing_accounts", account_id)]["subscription_status"] = "active"
+    client.documents[("customer_wallets", wallet_id)] = {
+        "schema_version": 1,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "currency": "USD",
+        "status": "active",
+        "available_credit_nanos": 5_000_000_000,
+        "reserved_credit_nanos": 0,
+        "settled_usage_nanos": 0,
+        "lifetime_credited_nanos": 5_000_000_000,
+        "created_at": now,
+        "updated_at": now,
+    }
+    stripe = FakeStripeGateway(
+        events={b"combined_refund_cancel_fail_payload": refund_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={"sub_combined_fail": {"id": "sub_combined_fail", "status": "active"}},
+        charges={"ch_combined_cancel_fail": charge_obj},
+    )
+    stripe.cancel_error = StripeGatewayError("Stripe API connection timed out")
+    service = _service(client, stripe, now)
+
+    with pytest.raises(BillingApiError) as exc_info:
+        service.handle_sync(raw_payload=b"combined_refund_cancel_fail_payload", stripe_signature="signature")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.code == "stripe_subscription_cancellation_failed"
+
+    # Account must NOT be marked canceled
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] != "canceled"
+    assert account["subscription_cancellation_pending"] is True
+
+    # Durable cancellation intent must be recorded and pending
+    cancellation_req = client.documents[("subscription_cancellation_requests", "re_combined_cancel_fail")]
+    assert cancellation_req["status"] == "pending"
+    assert "Stripe API connection timed out" in cancellation_req["last_error"]
+    assert cancellation_req["attempts"] == 1
+
+    # Simulate Stripe retry: Stripe redelivers the event after transient failure clears
+    stripe.cancel_error = None
+    retry_result = service.handle_sync(raw_payload=b"combined_refund_cancel_fail_payload", stripe_signature="signature")
+
+    assert retry_result.outcome == "charge_refunded"
+    assert "sub_combined_fail" in getattr(stripe, "cancelled_subscriptions", [])
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["subscription_cancellation_pending"] is False
+    assert cancellation_req["status"] == "completed"
+
 
 
 
