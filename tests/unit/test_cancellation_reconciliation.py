@@ -769,7 +769,9 @@ def test_reconcile_migration_paginates_with_intermediate_checkpoint() -> None:
 
 
 def test_lease_seconds_clamped_to_safe_minimum() -> None:
-    """Accidental 0 or values below 180 must be clamped to safe operational floor of 180s."""
+    """Accidental 0 or values below 180 must be clamped to safe operational floor of 180s for both worker and webhook."""
+    from services.billing_api_v3.app.services.webhook_service import StripeWebhookService
+
     raw_settings = BillingApiSettings(
         project_id="test",
         region="us-central1",
@@ -794,5 +796,67 @@ def test_lease_seconds_clamped_to_safe_minimum() -> None:
         settings=raw_settings,
     )
     assert worker._lease_seconds >= 180
+
+    # Exercise webhook service with the same raw_settings
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    client = FakeFirestore()
+    account_id = customer_billing_account_document_id("user-clamp")
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-clamp",
+            owner_uid="user-clamp",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_clamp",
+        "subscription_cancellation_pending": True,
+    }
+    client.documents[("subscription_cancellation_requests", "re_clamp")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_clamp",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-clamp",
+        "owner_uid": "user-clamp",
+        "stripe_subscription_id": "sub_clamp",
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    claimed_expiry = None
+    stripe = FakeStripeGateway()
+    orig_cancel = stripe.cancel_subscription
+
+    def intercept_cancel(sub_id: str) -> dict[str, Any]:
+        nonlocal claimed_expiry
+        doc = client.documents[("subscription_cancellation_requests", "re_clamp")]
+        claimed_expiry = doc.get("leased_until")
+        return orig_cancel(sub_id)
+
+    stripe.cancel_subscription = intercept_cancel
+
+    webhook_svc = StripeWebhookService(
+        stripe_gateway=stripe,
+        settings=raw_settings,
+        now_factory=lambda: now,
+        firestore_client_factory=lambda: client,
+        transaction_runner=lambda cl, op: op(cl.transaction()),
+    )
+    cancel_ref = client.collection("subscription_cancellation_requests").document("re_clamp")
+    acc_ref = client.collection("customer_billing_accounts").document(account_id)
+
+    webhook_svc._execute_pending_cancellation(
+        client,
+        {
+            "stripe_subscription_id": "sub_clamp",
+            "cancellation_ref": cancel_ref,
+            "account_ref": acc_ref,
+            "refund_id": "re_clamp",
+        },
+    )
+
+    assert claimed_expiry is not None
+    assert claimed_expiry >= now + timedelta(seconds=180)
 
 
