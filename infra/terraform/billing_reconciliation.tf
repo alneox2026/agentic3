@@ -59,7 +59,7 @@ resource "google_cloud_scheduler_job" "cancellation_reconciliation" {
 
     oidc_token {
       service_account_email = google_service_account.billing_reconciler.email
-      audience              = google_cloud_run_v2_service.billing_api.uri
+      audience              = var.billing_api_reconciliation_audience != "" ? var.billing_api_reconciliation_audience : google_cloud_run_v2_service.billing_api.uri
     }
   }
 

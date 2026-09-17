@@ -410,3 +410,129 @@ def test_reconcile_skips_intent_with_future_next_attempt_at() -> None:
     assert result.completed_cancellations == 0
     assert stripe.cancelled_subscriptions == []
 
+
+def test_reconcile_prioritizes_ready_intents_over_backed_off_backlog() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_ready_1",
+        "subscription_cancellation_pending": True,
+    }
+
+    # Populate 25 backed-off intents with future next_attempt_at (would exceed batch_size=10)
+    for i in range(25):
+        doc_id = f"re_delayed_{i:02d}"
+        client.documents[("subscription_cancellation_requests", doc_id)] = {
+            "schema_version": 1,
+            "cancellation_request_id": doc_id,
+            "billing_account_id": account_id,
+            "billing_subject_id": "user-1",
+            "owner_uid": "user-1",
+            "stripe_subscription_id": "sub_delayed",
+            "status": "pending",
+            "next_attempt_at": now + timedelta(hours=1),
+            "created_at": now - timedelta(hours=2),
+            "updated_at": now - timedelta(hours=2),
+        }
+
+    # Populate 1 ready intent created later but with next_attempt_at in the past
+    client.documents[("subscription_cancellation_requests", "re_ready_target")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_ready_target",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_ready_1",
+        "status": "pending",
+        "next_attempt_at": now - timedelta(seconds=10),
+        "created_at": now - timedelta(seconds=10),
+        "updated_at": now - timedelta(seconds=10),
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync(batch_size=10)
+
+    # The ready intent should be processed and completed, not starved by the 25 delayed intents
+    assert result.completed_cancellations == 1
+    assert "sub_ready_1" in stripe.cancelled_subscriptions
+    ready_doc = client.documents[("subscription_cancellation_requests", "re_ready_target")]
+    assert ready_doc["status"] == "completed"
+
+
+def test_reconcile_fencing_token_prevents_stale_worker_finalization() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_stale_1",
+        "subscription_cancellation_pending": True,
+    }
+    client.documents[("subscription_cancellation_requests", "re_stale_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_stale_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_stale_1",
+        "status": "pending",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+
+    # Intercept transaction runner: after claim_lease_op runs, simulate another worker
+    # acquiring the lease by changing the lease_owner_token in Firestore before finalization
+    original_runner = service = None
+
+    def intercepted_runner(firestore_client: Any, operation: Callable[[Any], Any]) -> Any:
+        res = operation(firestore_client.transaction())
+        # If this was claim_lease_op, tamper with the lease_owner_token
+        doc = client.documents.get(("subscription_cancellation_requests", "re_stale_1"))
+        if doc and doc.get("lease_owner_token") and doc.get("status") == "pending":
+            doc["lease_owner_token"] = "different_worker_token_abc"
+        return res
+
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        transaction_runner=intercepted_runner,
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    # Worker calls stripe, but finalization is rejected because lease_owner_token mismatched
+    assert "sub_stale_1" in stripe.cancelled_subscriptions
+    assert result.completed_cancellations == 0
+    doc = client.documents[("subscription_cancellation_requests", "re_stale_1")]
+    assert doc["status"] == "pending"
+    assert doc["lease_owner_token"] == "different_worker_token_abc"
+
+

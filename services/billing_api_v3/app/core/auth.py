@@ -97,6 +97,16 @@ async def authenticate_reconciliation_request(request: Request) -> dict[str, Any
     if not settings.reconciliation_auth_required:
         return {"sub": "anonymous", "email": "anonymous"}
 
+    expected_audience = (settings.reconciliation_audience or "").strip()
+    expected_service_account = (settings.reconciliation_allowed_service_account or "").strip()
+
+    if not expected_audience or not expected_service_account:
+        raise BillingApiError(
+            500,
+            "reconciliation_auth_misconfigured",
+            "Reconciliation OIDC audience and allowed service account must be configured when reconciliation auth is enabled.",
+        )
+
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         raise BillingApiError(
@@ -113,9 +123,6 @@ async def authenticate_reconciliation_request(request: Request) -> dict[str, Any
             "Authorization must be a Bearer token.",
         )
 
-    expected_audience = settings.reconciliation_audience
-    expected_service_account = settings.reconciliation_allowed_service_account
-
     try:
         if _reconciliation_token_verifier is not None:
             claims = _reconciliation_token_verifier(token.strip(), expected_audience)
@@ -127,7 +134,7 @@ async def authenticate_reconciliation_request(request: Request) -> dict[str, Any
                 id_token.verify_oauth2_token,
                 token.strip(),
                 GoogleAuthRequest(),
-                audience=expected_audience or None,
+                audience=expected_audience,
             )
     except BillingApiError:
         raise
@@ -138,23 +145,21 @@ async def authenticate_reconciliation_request(request: Request) -> dict[str, Any
             f"The Google OIDC token could not be verified: {exc}",
         ) from exc
 
-    if expected_audience:
-        token_audience = str(claims.get("aud", "")).strip()
-        if token_audience != expected_audience:
-            raise BillingApiError(
-                401,
-                "invalid_reconciliation_audience",
-                f"Scheduler OIDC token audience mismatch (expected {expected_audience}).",
-            )
+    token_audience = str(claims.get("aud", "")).strip()
+    if token_audience != expected_audience:
+        raise BillingApiError(
+            401,
+            "invalid_reconciliation_audience",
+            f"Scheduler OIDC token audience mismatch (expected {expected_audience}).",
+        )
 
-    if expected_service_account:
-        token_email = str(claims.get("email", "")).strip()
-        if token_email != expected_service_account:
-            raise BillingApiError(
-                403,
-                "forbidden_service_account",
-                f"Scheduler OIDC token service account mismatch (expected {expected_service_account}).",
-            )
+    token_email = str(claims.get("email", "")).strip()
+    if token_email != expected_service_account:
+        raise BillingApiError(
+            403,
+            "forbidden_service_account",
+            f"Scheduler OIDC token service account mismatch (expected {expected_service_account}).",
+        )
 
     return claims
 

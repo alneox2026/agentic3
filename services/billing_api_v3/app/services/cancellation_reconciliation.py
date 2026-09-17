@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+import uuid
 
 from services.billing_api_v3.app.core.config import BillingApiSettings, get_settings
 from services.billing_api_v3.app.services.firestore_client import (
@@ -35,13 +36,23 @@ def _default_firestore_client(project_id: str) -> Any:
     return firestore.Client(project=project_id)
 
 
+def _sort_key_next_attempt_at(snapshot: Any) -> datetime:
+    data = snapshot.to_dict() or {}
+    val = data.get("next_attempt_at")
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
 class CancellationReconciliationService:
     """Scans and resolves pending and unresolved subscription cancellation intents.
 
     Handles scenarios where Stripe webhook retries were exhausted, webhook delivery
     was out of order, or transient network timeouts interrupted local completion.
-    Uses lease claims and exponential backoff on next_attempt_at to prevent worker races
-    and head-of-line starvation.
+    Uses lease claims, lease-owner fencing tokens, and exponential backoff on next_attempt_at
+    to prevent worker races and head-of-line starvation.
     """
 
     def __init__(
@@ -52,7 +63,7 @@ class CancellationReconciliationService:
         settings: BillingApiSettings | None = None,
         transaction_runner: Callable[[Any, Callable[[Any], Any]], Any] | None = None,
         now_factory: Callable[[], datetime] | None = None,
-        lease_seconds: int = 60,
+        lease_seconds: int = 180,
     ) -> None:
         self._settings = settings or get_settings()
         self._firestore_client_factory = firestore_client_factory or (
@@ -124,6 +135,7 @@ class CancellationReconciliationService:
 
             # Atomically claim lease on this cancellation request to avoid concurrent execution
             lease_expiry = now_ts + timedelta(seconds=self._lease_seconds)
+            lease_token = uuid.uuid4().hex
 
             def claim_lease_op(transaction: Any) -> bool:
                 snap = get_transaction_document_snapshot(transaction, cancel_ref)
@@ -142,6 +154,7 @@ class CancellationReconciliationService:
                     cancel_ref,
                     {
                         "leased_until": lease_expiry,
+                        "lease_owner_token": lease_token,
                         "updated_at": now_ts,
                     },
                 )
@@ -179,10 +192,17 @@ class CancellationReconciliationService:
                 else:
                     # Not yet available; release lease and back off briefly (60s)
                     def release_unresolved_op(transaction: Any) -> None:
+                        snap = get_transaction_document_snapshot(transaction, cancel_ref)
+                        if not snap.exists:
+                            return
+                        current_data = snap.to_dict() or {}
+                        if current_data.get("lease_owner_token") != lease_token:
+                            return
                         transaction.update(
                             cancel_ref,
                             {
                                 "leased_until": None,
+                                "lease_owner_token": None,
                                 "next_attempt_at": now_ts + timedelta(seconds=60),
                                 "updated_at": now_ts,
                             },
@@ -204,6 +224,12 @@ class CancellationReconciliationService:
                     next_attempt = now_ts + timedelta(seconds=backoff_seconds)
 
                     def record_failure_op(transaction: Any) -> None:
+                        snap = get_transaction_document_snapshot(transaction, cancel_ref)
+                        if not snap.exists:
+                            return
+                        current_data = snap.to_dict() or {}
+                        if current_data.get("lease_owner_token") != lease_token:
+                            return
                         transaction.update(
                             cancel_ref,
                             {
@@ -212,6 +238,7 @@ class CancellationReconciliationService:
                                 "last_error": str(exc),
                                 "next_attempt_at": next_attempt,
                                 "leased_until": None,
+                                "lease_owner_token": None,
                                 "updated_at": now_ts,
                             },
                         )
@@ -220,13 +247,20 @@ class CancellationReconciliationService:
                         self._transaction_runner(client, record_failure_op)
                     continue
 
-                def finalize_op(transaction: Any) -> None:
+                def finalize_op(transaction: Any) -> bool:
+                    snap = get_transaction_document_snapshot(transaction, cancel_ref)
+                    if not snap.exists:
+                        return False
+                    current_data = snap.to_dict() or {}
+                    if current_data.get("lease_owner_token") != lease_token:
+                        return False
                     transaction.update(
                         cancel_ref,
                         {
                             "status": "completed",
                             "completed_at": now_ts,
                             "leased_until": None,
+                            "lease_owner_token": None,
                             "updated_at": now_ts,
                         },
                     )
@@ -242,9 +276,13 @@ class CancellationReconciliationService:
                                 "updated_at": now_ts,
                             },
                         )
+                    return True
 
-                self._transaction_runner(client, finalize_op)
-                completed += 1
+                finalized = False
+                with suppress(Exception):
+                    finalized = self._transaction_runner(client, finalize_op)
+                if finalized:
+                    completed += 1
 
         return CancellationReconciliationResult(
             scanned_intents=scanned,
@@ -261,22 +299,25 @@ class CancellationReconciliationService:
             "subscription_cancellation_requests_v3",
         )
         coll = client.collection(collection_name)
-        # Fetch candidate batch; caller filters leased/backoff items
+        # Fetch candidate batch ordered by next_attempt_at to prevent delayed records from starving ready work
         fetch_limit = max(10, limit * 2)
         try:
             from google.cloud.firestore_v1.base_query import FieldFilter
 
             return list(
                 coll.where(filter=FieldFilter("status", "in", ["unresolved", "pending"]))
+                .order_by("next_attempt_at")
                 .limit(fetch_limit)
                 .stream()
             )
         except Exception:
             if hasattr(coll, "stream"):
-                return [
+                candidates = [
                     s
                     for s in coll.stream()
                     if (s.to_dict() or {}).get("status") in ("unresolved", "pending")
-                ][:fetch_limit]
+                ]
+                candidates.sort(key=_sort_key_next_attempt_at)
+                return candidates[:fetch_limit]
             return []
 

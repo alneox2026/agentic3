@@ -529,7 +529,7 @@ variable "billing_api_reconciliation_allowed_service_account" {
 }
 
 variable "billing_api_reconciliation_audience" {
-  description = "Expected OIDC audience for reconciliation requests when application-level auth is enabled."
+  description = "Expected OIDC audience for reconciliation requests when application-level auth is enabled. Defaults to the Billing API Cloud Run service URL when empty."
   type        = string
   default     = ""
 }

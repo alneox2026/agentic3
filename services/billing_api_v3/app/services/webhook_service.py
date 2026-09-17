@@ -1362,6 +1362,9 @@ class StripeWebhookService:
                             "created_at": processed_at,
                             "updated_at": processed_at,
                             "attempts": 0,
+                            "next_attempt_at": processed_at,
+                            "leased_until": None,
+                            "lease_owner_token": None,
                         },
                     )
                 transaction.update(

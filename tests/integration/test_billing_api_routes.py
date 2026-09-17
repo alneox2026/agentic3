@@ -67,10 +67,42 @@ def test_webhook_uses_the_untouched_raw_body_and_stripe_signature(monkeypatch):
     assert response.json() == {"ok": True, "outcome": "topup_credited", "duplicate": False}
 
 
+def test_reconcile_route_fails_closed_when_audience_is_empty(monkeypatch):
+    from services.billing_api_v3.app.core.config import get_settings
+    get_settings.cache_clear()
+    monkeypatch.setenv("BILLING_RECONCILIATION_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("BILLING_RECONCILIATION_AUDIENCE", "")
+    monkeypatch.setenv("BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", "reconciler@proj.iam.gserviceaccount.com")
+
+    response = client.post(
+        "/v1/billing/internal/cancellation/reconcile",
+        headers={"Authorization": "Bearer fake_token"},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "reconciliation_auth_misconfigured"
+
+
+def test_reconcile_route_fails_closed_when_service_account_is_empty(monkeypatch):
+    from services.billing_api_v3.app.core.config import get_settings
+    get_settings.cache_clear()
+    monkeypatch.setenv("BILLING_RECONCILIATION_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("BILLING_RECONCILIATION_AUDIENCE", "https://expected-billing-api.run.app")
+    monkeypatch.setenv("BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", "")
+
+    response = client.post(
+        "/v1/billing/internal/cancellation/reconcile",
+        headers={"Authorization": "Bearer fake_token"},
+    )
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "reconciliation_auth_misconfigured"
+
+
 def test_reconcile_route_rejects_missing_authorization_header(monkeypatch):
     from services.billing_api_v3.app.core.config import get_settings
     get_settings.cache_clear()
     monkeypatch.setenv("BILLING_RECONCILIATION_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("BILLING_RECONCILIATION_AUDIENCE", "https://expected-billing-api.run.app")
+    monkeypatch.setenv("BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", "reconciler@proj.iam.gserviceaccount.com")
 
     response = client.post("/v1/billing/internal/cancellation/reconcile")
     assert response.status_code == 401
@@ -81,6 +113,8 @@ def test_reconcile_route_rejects_invalid_bearer_token(monkeypatch):
     from services.billing_api_v3.app.core.config import get_settings
     get_settings.cache_clear()
     monkeypatch.setenv("BILLING_RECONCILIATION_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("BILLING_RECONCILIATION_AUDIENCE", "https://expected-billing-api.run.app")
+    monkeypatch.setenv("BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", "reconciler@proj.iam.gserviceaccount.com")
 
     response = client.post(
         "/v1/billing/internal/cancellation/reconcile",

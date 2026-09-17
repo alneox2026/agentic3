@@ -69,7 +69,7 @@ locals {
     FIRESTORE_STRIPE_WEBHOOK_EVENTS_COLLECTION        = var.firestore_stripe_webhook_events_collection
     BILLING_RECONCILIATION_REQUIRE_AUTH               = tostring(var.billing_api_require_reconciliation_auth)
     BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT    = var.billing_api_reconciliation_allowed_service_account != "" ? var.billing_api_reconciliation_allowed_service_account : google_service_account.billing_reconciler.email
-    BILLING_RECONCILIATION_AUDIENCE                   = var.billing_api_reconciliation_audience
+    BILLING_RECONCILIATION_AUDIENCE                   = var.billing_api_reconciliation_audience != "" ? var.billing_api_reconciliation_audience : google_cloud_run_v2_service.billing_api.uri
   }
 
   # Pin a numbered secret version. Do not use latest for environment-variable
