@@ -67,13 +67,9 @@ locals {
     FIRESTORE_CUSTOMER_BILLING_PERIODS_COLLECTION     = var.firestore_customer_billing_periods_collection
     FIRESTORE_CUSTOMER_BILLING_ACCOUNTS_COLLECTION    = var.firestore_customer_billing_accounts_collection
     FIRESTORE_STRIPE_WEBHOOK_EVENTS_COLLECTION        = var.firestore_stripe_webhook_events_collection
-  }
-
-  gateway_secret_env = var.gemini_api_key_secret_id == "" ? {} : {
-    GEMINI_API_KEY = {
-      secret  = var.gemini_api_key_secret_id
-      version = var.gemini_api_key_secret_version
-    }
+    BILLING_RECONCILIATION_REQUIRE_AUTH               = tostring(var.billing_api_require_reconciliation_auth)
+    BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT    = var.billing_api_reconciliation_allowed_service_account != "" ? var.billing_api_reconciliation_allowed_service_account : google_service_account.billing_reconciler.email
+    BILLING_RECONCILIATION_AUDIENCE                   = var.billing_api_reconciliation_audience
   }
 
   # Pin a numbered secret version. Do not use latest for environment-variable

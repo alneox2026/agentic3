@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from typing import Any, Callable
 
 from fastapi import Request
 
@@ -75,3 +76,85 @@ async def authenticate_request(request: Request) -> str:
             "The Firebase ID token did not include a valid user id.",
         )
     return user_id
+
+
+_reconciliation_token_verifier: Callable[[str, str], dict[str, Any]] | None = None
+
+
+def set_reconciliation_token_verifier(
+    verifier: Callable[[str, str], dict[str, Any]] | None,
+) -> None:
+    """Override OIDC token verifier for testing."""
+    global _reconciliation_token_verifier
+    _reconciliation_token_verifier = verifier
+
+
+async def authenticate_reconciliation_request(request: Request) -> dict[str, Any]:
+    """Verify Cloud Scheduler Google OIDC token protecting internal reconciliation."""
+    from services.billing_api_v3.app.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.reconciliation_auth_required:
+        return {"sub": "anonymous", "email": "anonymous"}
+
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        raise BillingApiError(
+            401,
+            "missing_reconciliation_token",
+            "A Google OIDC token is required in the Authorization header.",
+        )
+
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise BillingApiError(
+            401,
+            "invalid_authorization_header",
+            "Authorization must be a Bearer token.",
+        )
+
+    expected_audience = settings.reconciliation_audience
+    expected_service_account = settings.reconciliation_allowed_service_account
+
+    try:
+        if _reconciliation_token_verifier is not None:
+            claims = _reconciliation_token_verifier(token.strip(), expected_audience)
+        else:
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+            from google.oauth2 import id_token
+
+            claims = await asyncio.to_thread(
+                id_token.verify_oauth2_token,
+                token.strip(),
+                GoogleAuthRequest(),
+                audience=expected_audience or None,
+            )
+    except BillingApiError:
+        raise
+    except Exception as exc:
+        raise BillingApiError(
+            401,
+            "invalid_reconciliation_token",
+            f"The Google OIDC token could not be verified: {exc}",
+        ) from exc
+
+    if expected_audience:
+        token_audience = str(claims.get("aud", "")).strip()
+        if token_audience != expected_audience:
+            raise BillingApiError(
+                401,
+                "invalid_reconciliation_audience",
+                f"Scheduler OIDC token audience mismatch (expected {expected_audience}).",
+            )
+
+    if expected_service_account:
+        token_email = str(claims.get("email", "")).strip()
+        if token_email != expected_service_account:
+            raise BillingApiError(
+                403,
+                "forbidden_service_account",
+                f"Scheduler OIDC token service account mismatch (expected {expected_service_account}).",
+            )
+
+    return claims
+

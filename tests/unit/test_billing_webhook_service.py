@@ -7,6 +7,7 @@ from common.billing import (
     customer_billing_account_document_id,
     customer_billing_period_document_id,
     customer_wallet_document_id,
+    stripe_webhook_event_document_id,
 )
 from services.billing_api_v3.app.core.config import BillingApiSettings
 from services.billing_api_v3.app.core.errors import BillingApiError
@@ -1835,6 +1836,93 @@ def test_stale_invoice_paid_event_cannot_resurrect_active_status_after_cancellat
     account = client.documents[("customer_billing_accounts", account_id)]
     assert account["subscription_status"] == "canceled"
     assert account["stripe_subscription_status"] == "canceled"
+
+
+def test_stale_event_with_older_created_timestamp_does_not_mutate_account_or_regress_monotonic_timestamp():
+    """An event with an older creation timestamp than the account's monotonic watermark
+
+    must only receive its receipt with outcome='ignored' and must NOT mutate subscription
+    period fields or regress last_subscription_event_created_at.
+    """
+    watermark_ts = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    current_period_start = datetime(2026, 8, 15, 0, 0, tzinfo=timezone.utc)
+    current_period_end = datetime(2026, 9, 15, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 16, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_billing_accounts", account_id)].update(
+        {
+            "stripe_subscription_id": "sub_test_123",
+            "subscription_status": "active",
+            "stripe_subscription_status": "active",
+            "stripe_subscription_current_period_start": current_period_start,
+            "stripe_subscription_current_period_end": current_period_end,
+            "last_subscription_event_created_at": watermark_ts,
+        }
+    )
+
+    # Older event created on 2026-08-12 (timestamp 1786492800 < watermark 1786795200)
+    stale_created_epoch = 1786492800
+    stale_period_start = 1786400000
+    stale_period_end = 1786490000
+    stale_sub_event = {
+        "id": "evt_stale_monotonic",
+        "type": "customer.subscription.updated",
+        "created": stale_created_epoch,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "sub_test_123",
+                "status": "past_due",
+                "customer": "cus_test_123",
+                "current_period_start": stale_period_start,
+                "current_period_end": stale_period_end,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    }
+
+    stripe = FakeStripeGateway(
+        events={b"stale_monotonic_payload": stale_sub_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={
+            "sub_test_123": {
+                "id": "sub_test_123",
+                "status": "past_due",
+                "livemode": False,
+                "customer": "cus_test_123",
+                "current_period_start": stale_period_start,
+                "current_period_end": stale_period_end,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"stale_monotonic_payload", stripe_signature="signature")
+    assert result.outcome == "ignored"
+
+    # Monotonic timestamp and period fields MUST NOT regress
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["last_subscription_event_created_at"] == watermark_ts
+    assert account["stripe_subscription_current_period_start"] == current_period_start
+    assert account["stripe_subscription_current_period_end"] == current_period_end
+    assert account["stripe_subscription_status"] == "active"
+
+    # Event receipt must be stored with outcome 'ignored' so Stripe doesn't redeliver
+    receipt_doc_id = stripe_webhook_event_document_id("evt_stale_monotonic")
+    receipt = client.documents[("stripe_webhook_events", receipt_doc_id)]
+    assert receipt["outcome"] == "ignored"
+
 
 
 

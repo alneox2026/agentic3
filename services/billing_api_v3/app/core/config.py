@@ -31,6 +31,15 @@ class BillingApiSettings:
     checkout_session_ttl_seconds: int
     stripe_webhook_tolerance_seconds: int
     subscription_cancellation_requests_collection: str = "subscription_cancellation_requests_v3"
+    reconciliation_auth_required: bool = True
+    reconciliation_audience: str = ""
+    reconciliation_allowed_service_account: str = ""
+
+
+def _parse_bool(value: str | None, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=1)
@@ -84,4 +93,11 @@ def get_settings() -> BillingApiSettings:
             "subscription_cancellation_requests_v3",
         ).strip()
         or "subscription_cancellation_requests_v3",
+        reconciliation_auth_required=_parse_bool(
+            os.getenv("BILLING_RECONCILIATION_REQUIRE_AUTH"), default=True
+        ),
+        reconciliation_audience=os.getenv("BILLING_RECONCILIATION_AUDIENCE", "").strip(),
+        reconciliation_allowed_service_account=os.getenv(
+            "BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", ""
+        ).strip(),
     )

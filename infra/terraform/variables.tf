@@ -13,19 +13,19 @@ variable "region" {
 variable "gateway_service_name" {
   description = "Cloud Run service name for the public agent gateway."
   type        = string
-  default     = "agentic3-gateway"
+  default     = "ceoagent-gateway-v3"
 }
 
 variable "worker_service_name" {
   description = "Cloud Run service name for the persistence worker."
   type        = string
-  default     = "agentic3-worker"
+  default     = "ceoagent-persistence-worker-v3"
 }
 
 variable "billing_api_service_name" {
   description = "Cloud Run service name for the public Stripe Billing API."
   type        = string
-  default     = "agentic3-billing"
+  default     = "ceoagent-billing-api-v3"
 }
 
 variable "gateway_image" {
@@ -46,31 +46,31 @@ variable "billing_api_image" {
 variable "gateway_service_account_name" {
   description = "Service account name for the gateway service."
   type        = string
-  default     = "agentic3-gateway-sa"
+  default     = "ceoagent-gateway-sa-v3"
 }
 
 variable "worker_service_account_name" {
   description = "Service account name for the worker service."
   type        = string
-  default     = "agentic3-worker-sa"
+  default     = "ceoagent-worker-sa-v3"
 }
 
 variable "billing_api_service_account_name" {
   description = "Service account name for the Stripe Billing API."
   type        = string
-  default     = "agentic3-billing-sa"
+  default     = "ceoagent-billing-api-sa-v3"
 }
 
 variable "eventarc_service_account_name" {
   description = "Service account name for the Eventarc trigger."
   type        = string
-  default     = "agentic3-eventarc-sa"
+  default     = "ceoagent-eventarc-sa-v3"
 }
 
 variable "billing_reconciler_service_account_name" {
   description = "Service account name for the Cloud Scheduler billing reconciler."
   type        = string
-  default     = "agentic3-reconciler-sa"
+  default     = "ceoagent-reconciler-sa-v3"
 }
 
 
@@ -83,7 +83,7 @@ variable "default_model_name" {
 variable "pubsub_topic_name" {
   description = "Topic for completed turn events."
   type        = string
-  default     = "agentic3-turn-events"
+  default     = "agent-turn-events-v3"
 }
 
 variable "pubsub_publish_timeout_seconds" {
@@ -156,62 +156,62 @@ variable "upstream_read_timeout_seconds" {
 variable "firestore_threads_collection" {
   description = "Top-level Firestore collection for chat threads."
   type        = string
-  default     = "agentic3_threads"
+  default     = "agent_threads_v3"
 }
 
 variable "firestore_messages_subcollection" {
   description = "Subcollection name for messages under each thread document."
   type        = string
-  default     = "messages_agentic3"
+  default     = "messages_v3"
 }
 
 
 variable "firestore_idempotency_collection" {
   description = "Top-level Firestore collection for processed event ids."
   type        = string
-  default     = "processed_events_agentic3"
+  default     = "processed_events_v3"
 }
 
 variable "firestore_billing_ledger_collection" {
   description = "Top-level immutable Firestore collection for completed-turn billing ledgers."
   type        = string
-  default     = "agent_billing_ledger_agentic3"
+  default     = "agent_billing_ledger_v3"
 }
 
 variable "firestore_customer_wallets_collection" {
   description = "Top-level Firestore collection for server-owned prepaid customer wallets."
   type        = string
-  default     = "customer_wallets_agentic3"
+  default     = "customer_wallets_v3"
 }
 
 variable "firestore_billing_reservations_collection" {
   description = "Top-level Firestore collection for per-turn prepaid-credit reservations."
   type        = string
-  default     = "billing_reservations_agentic3"
+  default     = "billing_reservations_v3"
 }
 
 variable "firestore_wallet_transactions_collection" {
   description = "Top-level immutable Firestore collection for customer wallet transactions."
   type        = string
-  default     = "wallet_transactions_agentic3"
+  default     = "wallet_transactions_v3"
 }
 
 variable "firestore_customer_billing_periods_collection" {
   description = "Top-level Firestore collection for customer monthly billing aggregates."
   type        = string
-  default     = "customer_billing_periods_agentic3"
+  default     = "customer_billing_periods_v3"
 }
 
 variable "firestore_customer_billing_accounts_collection" {
   description = "Top-level private Firestore collection mapping billing subjects to Stripe customer and subscription state."
   type        = string
-  default     = "customer_billing_accounts_agentic3"
+  default     = "customer_billing_accounts_v3"
 }
 
 variable "firestore_stripe_webhook_events_collection" {
   description = "Top-level private Firestore collection for immutable Stripe webhook event receipts."
   type        = string
-  default     = "stripe_webhook_events_agentic3"
+  default     = "stripe_webhook_events_v3"
 }
 
 
@@ -240,7 +240,7 @@ variable "billing_api_stripe_secret_key_secret_version" {
 variable "billing_api_stripe_webhook_signing_secret_id" {
   description = "Secret Manager secret ID for the Stripe webhook signing secret."
   type        = string
-  default     = "stripe-webhook-signing-secret-agentic3"
+  default     = "stripe-webhook-signing-secret-v3"
 }
 
 variable "billing_api_stripe_webhook_signing_secret_version" {
@@ -387,7 +387,7 @@ variable "gateway_max_instances" {
 variable "gateway_concurrency" {
   description = "Maximum concurrent requests per gateway instance."
   type        = number
-  default     = 20
+  default     = 16
 }
 
 variable "gateway_cpu" {
@@ -405,26 +405,7 @@ variable "gateway_memory" {
 variable "gateway_timeout" {
   description = "Gateway request timeout."
   type        = string
-  default     = "600s"
-}
-
-variable "gemini_api_key_secret_id" {
-  description = "Existing Secret Manager secret ID containing the Google Gemini API key."
-  type        = string
-  default     = "gemini-api-key"
-}
-
-variable "gemini_api_key_secret_version" {
-  description = "Pinned numeric version of the Gemini API key Secret Manager secret."
-  type        = string
-  default     = "1"
-}
-
-variable "gemini_api_key" {
-  description = "Direct Gemini API key (optional fallback when Secret Manager is not used)."
-  type        = string
-  default     = ""
-  sensitive   = true
+  default     = "300s"
 }
 
 variable "cloud_run_execution_environment" {
@@ -531,6 +512,24 @@ variable "worker_eventarc_allowed_service_account" {
 
 variable "worker_eventarc_audience" {
   description = "Expected OIDC audience for worker push requests when application-level Eventarc auth is enabled."
+  type        = string
+  default     = ""
+}
+
+variable "billing_api_require_reconciliation_auth" {
+  description = "Whether the billing API verifies Cloud Scheduler OIDC tokens on internal reconciliation routes."
+  type        = bool
+  default     = true
+}
+
+variable "billing_api_reconciliation_allowed_service_account" {
+  description = "Expected Cloud Scheduler service account email for reconciliation requests. Defaults to the Terraform-managed billing reconciler service account when empty."
+  type        = string
+  default     = ""
+}
+
+variable "billing_api_reconciliation_audience" {
+  description = "Expected OIDC audience for reconciliation requests when application-level auth is enabled."
   type        = string
   default     = ""
 }

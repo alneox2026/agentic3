@@ -7,7 +7,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import os
 from typing import Any
@@ -780,24 +780,33 @@ class StripeWebhookService:
             is_locally_canceled = (account.get("subscription_status") == "canceled")
             is_cancel_pending = bool(account.get("subscription_cancellation_pending"))
 
-            resolved_stripe_sub_status = fulfillment.subscription_status
-            if is_same_sub and (is_locally_canceled or is_cancel_pending) and fulfillment.subscription_status != "canceled":
-                resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
+            last_sub_event_ts = account.get("last_subscription_event_created_at")
+            is_stale_fee_event = bool(
+                last_sub_event_ts
+                and fulfillment.stripe_event_created_at
+                and fulfillment.stripe_event_created_at < last_sub_event_ts
+            )
 
-            transaction.update(
-                account_ref,
-                {
-                    "stripe_customer_id": fulfillment.stripe_customer_id,
-                    "stripe_customer_status": "ready",
+            account_updates: dict[str, Any] = {
+                "stripe_customer_id": fulfillment.stripe_customer_id,
+                "stripe_customer_status": "ready",
+                "last_service_fee_invoice_id": fulfillment.stripe_invoice_id,
+                "last_service_fee_paid_at": fulfillment.paid_at,
+                "updated_at": processed_at,
+            }
+            if not is_stale_fee_event:
+                resolved_stripe_sub_status = fulfillment.subscription_status
+                if is_same_sub and (is_locally_canceled or is_cancel_pending) and fulfillment.subscription_status != "canceled":
+                    resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
+
+                account_updates.update({
                     "stripe_subscription_id": fulfillment.stripe_subscription_id,
                     "stripe_subscription_status": resolved_stripe_sub_status,
                     "stripe_subscription_current_period_start": fulfillment.subscription_period_start,
                     "stripe_subscription_current_period_end": fulfillment.subscription_period_end,
-                    "last_service_fee_invoice_id": fulfillment.stripe_invoice_id,
-                    "last_service_fee_paid_at": fulfillment.paid_at,
-                    "updated_at": processed_at,
-                },
-            )
+                })
+
+            transaction.update(account_ref, account_updates)
             self._create_service_fee_event_receipt(
                 transaction=transaction,
                 event_ref=event_ref,
@@ -1032,29 +1041,32 @@ class StripeWebhookService:
             last_event_ts = account.get("last_subscription_event_created_at")
             is_stale_event = bool(last_event_ts and stripe_event_created_at and stripe_event_created_at < last_event_ts)
 
-            resolved_stripe_sub_status = subscription_status
-            if is_same_sub and (is_locally_canceled or is_cancel_pending) and subscription_status != "canceled":
-                resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
-            elif is_stale_event:
-                resolved_stripe_sub_status = account.get("stripe_subscription_status", subscription_status)
+            if is_stale_event:
+                outcome = "ignored"
+            else:
+                outcome = "subscription_state_updated"
+                resolved_stripe_sub_status = subscription_status
+                if is_same_sub and (is_locally_canceled or is_cancel_pending) and subscription_status != "canceled":
+                    resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
 
-            account_updates = {
-                "stripe_customer_id": stripe_customer_id,
-                "stripe_customer_status": "ready",
-                "stripe_subscription_id": stripe_subscription_id,
-                "stripe_subscription_status": resolved_stripe_sub_status,
-                "stripe_subscription_current_period_start": period_start,
-                "stripe_subscription_current_period_end": period_end,
-                "last_subscription_event_created_at": stripe_event_created_at,
-                "updated_at": processed_at,
-            }
-            if last_invoice_id:
-                account_updates["last_service_fee_invoice_id"] = last_invoice_id
-            transaction.update(account_ref, account_updates)
+                account_updates = {
+                    "stripe_customer_id": stripe_customer_id,
+                    "stripe_customer_status": "ready",
+                    "stripe_subscription_id": stripe_subscription_id,
+                    "stripe_subscription_status": resolved_stripe_sub_status,
+                    "stripe_subscription_current_period_start": period_start,
+                    "stripe_subscription_current_period_end": period_end,
+                    "last_subscription_event_created_at": stripe_event_created_at,
+                    "updated_at": processed_at,
+                }
+                if last_invoice_id:
+                    account_updates["last_service_fee_invoice_id"] = last_invoice_id
+                transaction.update(account_ref, account_updates)
 
             pending_cancellation: dict[str, Any] | None = None
             if (
-                unresolved_cancel_ref is not None
+                not is_stale_event
+                and unresolved_cancel_ref is not None
                 and unresolved_cancel_snapshot is not None
                 and unresolved_cancel_snapshot.exists
                 and stripe_subscription_id
@@ -1085,7 +1097,7 @@ class StripeWebhookService:
                     stripe_livemode=stripe_livemode,
                     catalog_environment=self._catalog.environment,
                     payload_sha256=payload_sha256,
-                    outcome="subscription_state_updated",
+                    outcome=outcome,
                     processed_at=processed_at,
                     billing_account_id=billing_account_id,
                     billing_subject_id=owner_uid,
@@ -1099,7 +1111,7 @@ class StripeWebhookService:
                 WebhookResult(
                     stripe_event_id=stripe_event_id,
                     stripe_event_type=stripe_event_type,
-                    outcome="subscription_state_updated",
+                    outcome=outcome,
                     duplicate=False,
                 ),
                 pending_cancellation,
@@ -1890,12 +1902,16 @@ class StripeWebhookService:
                 attempts = 1
                 if cancellation_snapshot.exists:
                     attempts = int((cancellation_snapshot.to_dict() or {}).get("attempts", 0)) + 1
+                backoff_seconds = min(3600, 30 * (2 ** min(attempts - 1, 6)))
+                next_attempt = now_ts + timedelta(seconds=backoff_seconds)
                 transaction.update(
                     cancel_ref,
                     {
                         "status": "pending",
                         "attempts": attempts,
                         "last_error": str(exc),
+                        "next_attempt_at": next_attempt,
+                        "leased_until": None,
                         "updated_at": now_ts,
                     },
                 )
@@ -1914,6 +1930,7 @@ class StripeWebhookService:
                 {
                     "status": "completed",
                     "completed_at": now_ts,
+                    "leased_until": None,
                     "updated_at": now_ts,
                 },
             )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -319,3 +319,94 @@ def test_reconcile_records_failure_and_increments_attempts_on_stripe_error() -> 
     assert intent_doc["status"] == "pending"
     assert intent_doc["attempts"] == 2
     assert "Stripe API connection timed out" in intent_doc["last_error"]
+    assert intent_doc["next_attempt_at"] > now
+    assert intent_doc["leased_until"] is None
+
+
+def test_reconcile_skips_intent_with_active_lease() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_leased_1",
+    }
+    # Intent actively leased by another worker until now + 30s
+    client.documents[("subscription_cancellation_requests", "re_leased_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_leased_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_leased_1",
+        "status": "pending",
+        "leased_until": now + timedelta(seconds=30),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+    assert result.scanned_intents == 1
+    assert result.skipped_intents == 1
+    assert result.completed_cancellations == 0
+    assert stripe.cancelled_subscriptions == []
+
+
+def test_reconcile_skips_intent_with_future_next_attempt_at() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_backoff_1",
+    }
+    # Intent backed off until now + 120s
+    client.documents[("subscription_cancellation_requests", "re_backoff_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_backoff_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_backoff_1",
+        "status": "pending",
+        "next_attempt_at": now + timedelta(seconds=120),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+    assert result.scanned_intents == 1
+    assert result.skipped_intents == 1
+    assert result.completed_cancellations == 0
+    assert stripe.cancelled_subscriptions == []
+

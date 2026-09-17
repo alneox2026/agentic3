@@ -7,7 +7,10 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from services.billing_api_v3.app.core.auth import authenticate_request
+from services.billing_api_v3.app.core.auth import (
+    authenticate_reconciliation_request,
+    authenticate_request,
+)
 from services.billing_api_v3.app.core.errors import BillingApiError
 from services.billing_api_v3.app.services.cancellation_reconciliation import (
     CancellationReconciliationService,
@@ -110,8 +113,11 @@ class CancellationReconciliationResponse(BaseModel):
     response_model=CancellationReconciliationResponse,
     include_in_schema=False,
 )
-async def reconcile_cancellation_intents() -> CancellationReconciliationResponse:
+async def reconcile_cancellation_intents(
+    request: Request,
+) -> CancellationReconciliationResponse:
     """Internal / Cloud Scheduler endpoint to reconcile pending & unresolved cancellation intents."""
+    await authenticate_reconciliation_request(request)
     service = CancellationReconciliationService()
     result = await service.reconcile_intents()
     return CancellationReconciliationResponse(
