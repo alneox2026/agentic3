@@ -97,6 +97,9 @@ cat > terraform.auto.tfvars.json <<EOF
 }
 EOF
 
+# Auto-import pre-existing GCP resources if not already present in Terraform state
+bash "${ROOT_DIR}/scripts/import_existing_resources.sh"
+
 terraform apply -auto-approve
 
 echo "================================================================="
