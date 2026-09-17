@@ -301,8 +301,10 @@ class CancellationReconciliationService:
             skipped_intents=skipped,
         )
 
-    def _backfill_missing_next_attempt_at(self, client: Any, now_ts: datetime) -> int:
-        """Checkpointed, paginated migration ordered by document ID to populate missing next_attempt_at."""
+    def _backfill_missing_next_attempt_at(
+        self, client: Any, now_ts: datetime, *, page_size: int = 100
+    ) -> int:
+        """Checkpointed, bounded single-page migration step ordered by document ID to populate missing next_attempt_at."""
         collection_name = getattr(
             self._settings,
             "subscription_cancellation_requests_collection",
@@ -322,7 +324,6 @@ class CancellationReconciliationService:
 
         cursor = checkpoint_data.get("cursor")
         total_migrated = int(checkpoint_data.get("migrated_count", 0))
-        page_size = 100
         migrated_in_run = 0
 
         def _doc_id(s: Any) -> str:
@@ -333,105 +334,100 @@ class CancellationReconciliationService:
                 or ""
             )
 
-        while True:
-            try:
-                from google.cloud.firestore_v1 import FieldPath
+        try:
+            from google.cloud.firestore_v1 import FieldPath
 
-                doc_id_field = FieldPath.document_id()
-                query = coll.order_by(doc_id_field)
+            doc_id_field = FieldPath.document_id()
+            query = coll.order_by(doc_id_field)
+            if cursor:
+                cursor_ref = coll.document(cursor)
+                cursor_snap = cursor_ref.get() if hasattr(cursor_ref, "get") else None
+                if cursor_snap and getattr(cursor_snap, "exists", False):
+                    query = query.start_after(cursor_snap)
+                else:
+                    query = query.start_after({doc_id_field: cursor})
+            query = query.limit(page_size)
+            docs = list(query.stream())
+        except (AttributeError, ModuleNotFoundError, ImportError):
+            docs = []
+            if hasattr(coll, "stream"):
+                all_snaps = list(coll.stream())
+                sorted_snaps = sorted(all_snaps, key=_doc_id)
                 if cursor:
-                    cursor_ref = coll.document(cursor)
-                    cursor_snap = cursor_ref.get() if hasattr(cursor_ref, "get") else None
-                    if cursor_snap and getattr(cursor_snap, "exists", False):
-                        query = query.start_after(cursor_snap)
-                    else:
-                        query = query.start_after({doc_id_field: cursor})
-                query = query.limit(page_size)
-                docs = list(query.stream())
-            except (AttributeError, ModuleNotFoundError, ImportError):
-                docs = []
-                if hasattr(coll, "stream"):
-                    all_snaps = list(coll.stream())
-                    sorted_snaps = sorted(all_snaps, key=_doc_id)
-                    if cursor:
-                        sorted_snaps = [s for s in sorted_snaps if _doc_id(s) > cursor]
-                    docs = sorted_snaps[:page_size]
+                    sorted_snaps = [s for s in sorted_snaps if _doc_id(s) > cursor]
+                docs = sorted_snaps[:page_size]
 
-            if not docs:
-                checkpoint_update = {
-                    "completed": True,
-                    "cursor": cursor,
-                    "migrated_count": total_migrated,
-                    "completed_at": now_ts,
-                    "updated_at": now_ts,
-                }
-                if hasattr(checkpoint_ref, "set"):
-                    checkpoint_ref.set(checkpoint_update, merge=True)
-                elif hasattr(checkpoint_ref, "update"):
-                    checkpoint_ref.update(checkpoint_update)
-                break
+        if not docs:
+            checkpoint_update = {
+                "completed": True,
+                "cursor": cursor,
+                "migrated_count": total_migrated,
+                "completed_at": now_ts,
+                "updated_at": now_ts,
+            }
+            if hasattr(checkpoint_ref, "set"):
+                checkpoint_ref.set(checkpoint_update, merge=True)
+            elif hasattr(checkpoint_ref, "update"):
+                checkpoint_ref.update(checkpoint_update)
+            return 0
 
-            for doc in docs:
-                item_id = _doc_id(doc)
-                if not item_id or item_id.startswith("__"):
-                    continue
+        for doc in docs:
+            item_id = _doc_id(doc)
+            if not item_id or item_id.startswith("__"):
+                continue
 
-                cursor = item_id
-                data = (doc.to_dict() or {}) if hasattr(doc, "to_dict") else {}
-                if data.get("status") not in ("unresolved", "pending"):
-                    continue
-                if "next_attempt_at" in data and data.get("next_attempt_at") is not None:
-                    continue
+            cursor = item_id
+            data = (doc.to_dict() or {}) if hasattr(doc, "to_dict") else {}
+            if data.get("status") not in ("unresolved", "pending"):
+                continue
+            if "next_attempt_at" in data and data.get("next_attempt_at") is not None:
+                continue
 
-                doc_ref = coll.document(item_id)
+            doc_ref = coll.document(item_id)
 
-                def backfill_op(transaction: Any) -> bool:
-                    snap = get_transaction_document_snapshot(transaction, doc_ref)
-                    if not snap.exists:
-                        return False
-                    current_data = snap.to_dict() or {}
-                    if current_data.get("status") not in ("unresolved", "pending"):
-                        return False
-                    if "next_attempt_at" in current_data and current_data.get("next_attempt_at") is not None:
-                        return False
-                    target_time = current_data.get("created_at") or now_ts
-                    transaction.update(
-                        doc_ref,
-                        {
-                            "next_attempt_at": target_time,
-                            "updated_at": now_ts,
-                        },
-                    )
-                    return True
+            def backfill_op(transaction: Any) -> bool:
+                snap = get_transaction_document_snapshot(transaction, doc_ref)
+                if not snap.exists:
+                    return False
+                current_data = snap.to_dict() or {}
+                if current_data.get("status") not in ("unresolved", "pending"):
+                    return False
+                if "next_attempt_at" in current_data and current_data.get("next_attempt_at") is not None:
+                    return False
+                target_time = current_data.get("created_at") or now_ts
+                transaction.update(
+                    doc_ref,
+                    {
+                        "next_attempt_at": target_time,
+                        "updated_at": now_ts,
+                    },
+                )
+                return True
 
-                if self._transaction_runner(client, backfill_op):
-                    total_migrated += 1
-                    migrated_in_run += 1
+            if self._transaction_runner(client, backfill_op):
+                total_migrated += 1
+                migrated_in_run += 1
 
-            if len(docs) < page_size:
-                checkpoint_update = {
-                    "completed": True,
-                    "cursor": cursor,
-                    "migrated_count": total_migrated,
-                    "completed_at": now_ts,
-                    "updated_at": now_ts,
-                }
-                if hasattr(checkpoint_ref, "set"):
-                    checkpoint_ref.set(checkpoint_update, merge=True)
-                elif hasattr(checkpoint_ref, "update"):
-                    checkpoint_ref.update(checkpoint_update)
-                break
-            else:
-                checkpoint_update = {
-                    "completed": False,
-                    "cursor": cursor,
-                    "migrated_count": total_migrated,
-                    "updated_at": now_ts,
-                }
-                if hasattr(checkpoint_ref, "set"):
-                    checkpoint_ref.set(checkpoint_update, merge=True)
-                elif hasattr(checkpoint_ref, "update"):
-                    checkpoint_ref.update(checkpoint_update)
+        if len(docs) < page_size:
+            checkpoint_update = {
+                "completed": True,
+                "cursor": cursor,
+                "migrated_count": total_migrated,
+                "completed_at": now_ts,
+                "updated_at": now_ts,
+            }
+        else:
+            checkpoint_update = {
+                "completed": False,
+                "cursor": cursor,
+                "migrated_count": total_migrated,
+                "updated_at": now_ts,
+            }
+
+        if hasattr(checkpoint_ref, "set"):
+            checkpoint_ref.set(checkpoint_update, merge=True)
+        elif hasattr(checkpoint_ref, "update"):
+            checkpoint_ref.update(checkpoint_update)
 
         return migrated_in_run
 

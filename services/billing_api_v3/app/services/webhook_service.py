@@ -1899,12 +1899,15 @@ class StripeWebhookService:
         now_ts = _as_utc(self._now_factory())
 
         # Atomically claim lease with lease_owner_token before calling Stripe
-        lease_seconds = int(
-            getattr(
-                self._settings,
-                "cancellation_lease_seconds",
-                getattr(self._settings, "cancellation_reconciliation_lease_seconds", 180),
-            )
+        lease_seconds = max(
+            10,
+            int(
+                getattr(
+                    self._settings,
+                    "cancellation_lease_seconds",
+                    getattr(self._settings, "cancellation_reconciliation_lease_seconds", 180),
+                )
+            ),
         )
         lease_expiry = now_ts + timedelta(seconds=lease_seconds)
         lease_token = uuid.uuid4().hex

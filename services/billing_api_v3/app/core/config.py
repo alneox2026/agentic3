@@ -101,7 +101,8 @@ def get_settings() -> BillingApiSettings:
         reconciliation_allowed_service_account=os.getenv(
             "BILLING_RECONCILIATION_ALLOWED_SERVICE_ACCOUNT", ""
         ).strip(),
-        cancellation_lease_seconds=int(
-            os.getenv("BILLING_CANCELLATION_LEASE_SECONDS", "180")
+        cancellation_lease_seconds=max(
+            10,
+            int(os.getenv("BILLING_CANCELLATION_LEASE_SECONDS", "180")),
         ),
     )

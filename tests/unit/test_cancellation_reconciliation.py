@@ -712,3 +712,89 @@ def test_shared_lease_seconds_configured_in_settings() -> None:
     assert service._lease_seconds == 180
 
 
+def test_reconcile_migration_paginates_with_intermediate_checkpoint() -> None:
+    """With 101 legacy documents and page_size=100, migration processes 1 page, persists cursor, and completes on page 2."""
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    client = FakeFirestore()
+
+    # Create 101 legacy documents: re_legacy_000 .. re_legacy_100
+    for i in range(101):
+        doc_id = f"re_legacy_{i:03d}"
+        client.documents[("subscription_cancellation_requests", doc_id)] = {
+            "schema_version": 1,
+            "cancellation_request_id": doc_id,
+            "billing_account_id": f"acc_{i}",
+            "status": "pending",
+            "attempts": 0,
+            "created_at": now - timedelta(minutes=i + 1),
+            "updated_at": now - timedelta(minutes=i + 1),
+        }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    # Invocation 1: processes exactly 1 page (100 docs)
+    migrated_1 = service._backfill_missing_next_attempt_at(client, now, page_size=100)
+    assert migrated_1 == 100
+
+    checkpoint_1 = client.documents[("subscription_cancellation_requests", "__migration_checkpoint_next_attempt_at__")]
+    assert checkpoint_1["completed"] is False
+    assert checkpoint_1["cursor"] == "re_legacy_099"
+    assert checkpoint_1["migrated_count"] == 100
+
+    # 101st doc must still be missing next_attempt_at
+    assert client.documents[("subscription_cancellation_requests", "re_legacy_100")].get("next_attempt_at") is None
+
+    # Invocation 2: resumes from cursor re_legacy_099, processes the 1 remaining doc, and marks complete
+    migrated_2 = service._backfill_missing_next_attempt_at(client, now, page_size=100)
+    assert migrated_2 == 1
+
+    checkpoint_2 = client.documents[("subscription_cancellation_requests", "__migration_checkpoint_next_attempt_at__")]
+    assert checkpoint_2["completed"] is True
+    assert checkpoint_2["cursor"] == "re_legacy_100"
+    assert checkpoint_2["migrated_count"] == 101
+    assert checkpoint_2["completed_at"] == now
+
+    # 101st doc now has next_attempt_at populated
+    assert client.documents[("subscription_cancellation_requests", "re_legacy_100")].get("next_attempt_at") is not None
+
+    # Invocation 3: detects completed checkpoint and does 0 queries/work
+    migrated_3 = service._backfill_missing_next_attempt_at(client, now, page_size=100)
+    assert migrated_3 == 0
+
+
+def test_lease_seconds_clamped_to_safe_minimum() -> None:
+    """Accidental 0 or negative lease seconds must be clamped to safe minimum of 10s."""
+    from services.billing_api_v3.app.services.webhook_service import StripeWebhookService
+
+    raw_settings = BillingApiSettings(
+        project_id="test",
+        region="us-central1",
+        log_level="INFO",
+        allowed_origins=[],
+        catalog_path=Path("config/billing.test.yaml"),
+        billing_accounts_collection="customer_billing_accounts",
+        stripe_webhook_events_collection="stripe_webhook_events",
+        wallets_collection="customer_wallets",
+        wallet_transactions_collection="wallet_transactions",
+        customer_billing_periods_collection="customer_billing_periods",
+        checkout_success_url="https://example.test/success",
+        checkout_cancel_url="https://example.test/cancelled",
+        checkout_session_ttl_seconds=1800,
+        stripe_webhook_tolerance_seconds=300,
+        cancellation_lease_seconds=0,  # invalid/zero value
+    )
+
+    worker = CancellationReconciliationService(
+        firestore_client_factory=lambda: FakeFirestore(),
+        stripe_gateway=FakeStripeGateway(),
+        settings=raw_settings,
+    )
+    assert worker._lease_seconds >= 10
+
+
