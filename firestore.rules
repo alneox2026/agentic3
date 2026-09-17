@@ -1,0 +1,51 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Subscription cancellation requests are strictly private to backend services.
+    // Client applications must NEVER have direct read or write access.
+    match /subscription_cancellation_requests_v3/{requestId} {
+      allow read, write: if false;
+    }
+
+    // Immutable audit receipts for Stripe webhook events.
+    match /stripe_webhook_events_v3/{eventId} {
+      allow read, write: if false;
+    }
+
+    // Customer billing accounts are readable only by their authenticated owner.
+    // Writes are performed strictly by backend services (Billing API).
+    match /customer_billing_accounts_v3/{accountId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.owner_uid;
+      allow write: if false;
+    }
+
+    // Customer wallets are readable only by their authenticated owner.
+    // Writes are restricted to backend transaction services.
+    match /customer_wallets_v3/{walletId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.owner_uid;
+      allow write: if false;
+    }
+
+    // Wallet transactions ledger is readable by the authenticated owner; writes are private.
+    match /wallet_transactions_v3/{txId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.owner_uid;
+      allow write: if false;
+    }
+
+    // Monthly billing periods aggregates are readable by the authenticated owner; writes are private.
+    match /customer_billing_periods_v3/{periodId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.owner_uid;
+      allow write: if false;
+    }
+
+    // Internal billing reservations and ledgers are strictly private.
+    match /billing_reservations/{reservationId} {
+      allow read, write: if false;
+    }
+
+    match /billing_ledgers/{ledgerId} {
+      allow read, write: if false;
+    }
+  }
+}

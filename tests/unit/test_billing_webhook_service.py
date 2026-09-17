@@ -1704,6 +1704,140 @@ def test_refund_created_before_subscription_updated_creates_unresolved_intent_an
     assert account["unresolved_cancellation_request_id"] is None
 
 
+def test_stale_subscription_updated_event_cannot_resurrect_active_status_after_cancellation():
+    """A stale or concurrent customer.subscription.updated reporting active status
+
+    for a subscription that was already canceled cannot overwrite stripe_subscription_status to active.
+    """
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    # Account has completed cancellation for subscription sub_test_123
+    client.documents[("customer_billing_accounts", account_id)].update(
+        {
+            "stripe_subscription_id": "sub_test_123",
+            "subscription_status": "canceled",
+            "stripe_subscription_status": "canceled",
+            "subscription_cancellation_pending": False,
+            "unresolved_cancellation_request_id": None,
+        }
+    )
+
+    stale_sub_event = {
+        "id": "evt_stale_sub_update",
+        "type": "customer.subscription.updated",
+        "created": 1786492800,
+        "livemode": False,
+        "data": {
+            "object": {
+                "id": "sub_test_123",
+                "status": "active",
+                "customer": "cus_test_123",
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    }
+
+    stripe = FakeStripeGateway(
+        events={b"stale_sub_payload": stale_sub_event},
+        checkout_sessions={},
+        invoices={},
+        subscriptions={
+            "sub_test_123": {
+                "id": "sub_test_123",
+                "status": "active",
+                "livemode": False,
+                "customer": "cus_test_123",
+                "current_period_start": 1786492800,
+                "current_period_end": 1789171200,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"stale_sub_payload", stripe_signature="signature")
+    assert result.outcome == "subscription_state_updated"
+
+    # Terminal cancellation state must be guarded: stripe_subscription_status remains canceled
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["stripe_subscription_status"] == "canceled"
+
+
+def test_stale_invoice_paid_event_cannot_resurrect_active_status_after_cancellation():
+    """A delayed invoice.paid event for an initial subscription checkout
+
+    cannot overwrite stripe_subscription_status to active once cancellation is complete.
+    """
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    _seed_account(client, account_id, now)
+    client.documents[("customer_billing_accounts", account_id)].update(
+        {
+            "stripe_subscription_id": "sub_test_123",
+            "subscription_status": "canceled",
+            "stripe_subscription_status": "canceled",
+            "subscription_cancellation_pending": False,
+        }
+    )
+
+    invoice_event = {
+        "id": "evt_stale_invoice_paid",
+        "type": "invoice.paid",
+        "created": 1786492801,
+        "livemode": False,
+        "data": {"object": {"id": "in_stale_123"}},
+    }
+    invoice = {
+        "id": "in_stale_123",
+        "livemode": False,
+        "customer": "cus_test_123",
+        "subscription": "sub_test_123",
+        "status_transitions": {"paid_at": 1786492801},
+        "lines": {"data": [{"price": "price_1U3ZYBB5Es3VU3maSP6qq6sg", "amount": 500}]},
+    }
+    stripe = FakeStripeGateway(
+        events={b"stale_invoice_payload": invoice_event},
+        checkout_sessions={},
+        invoices={"in_stale_123": invoice},
+        subscriptions={
+            "sub_test_123": {
+                "id": "sub_test_123",
+                "status": "active",
+                "livemode": False,
+                "customer": "cus_test_123",
+                "current_period_start": 1786492800,
+                "current_period_end": 1789171200,
+                "metadata": {
+                    "billing_account_id": account_id,
+                    "catalog_environment": "test",
+                },
+            }
+        },
+    )
+    service = _service(client, stripe, now)
+
+    result = service.handle_sync(raw_payload=b"stale_invoice_payload", stripe_signature="signature")
+    assert result.outcome == "service_fee_collected"
+
+    # Terminal cancellation state must be guarded
+    account = client.documents[("customer_billing_accounts", account_id)]
+    assert account["subscription_status"] == "canceled"
+    assert account["stripe_subscription_status"] == "canceled"
+
+
+
 
 
 

@@ -71,3 +71,10 @@ resource "google_cloud_run_v2_service_iam_member" "billing_api_public_invoker" {
   role     = "roles/run.invoker"
   member   = "allUsers"
 }
+
+resource "google_cloud_run_v2_service_iam_member" "billing_api_billing_reconciler_invoker" {
+  location = google_cloud_run_v2_service.billing_api.location
+  name     = google_cloud_run_v2_service.billing_api.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.billing_reconciler.email}"
+}

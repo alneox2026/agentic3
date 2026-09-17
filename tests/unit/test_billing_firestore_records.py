@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -73,3 +74,12 @@ def test_webhook_record_rejects_a_non_sha256_payload_digest() -> None:
             outcome="topup_credited",
             processed_at=NOW,
         )
+
+
+def test_firestore_rules_file_exists_and_denies_client_access_to_cancellation_requests() -> None:
+    rules_path = Path(__file__).resolve().parents[2] / "firestore.rules"
+    assert rules_path.exists(), "firestore.rules must be tracked in the repository root"
+    content = rules_path.read_text(encoding="utf-8")
+    assert "subscription_cancellation_requests_v3" in content
+    assert "allow read, write: if false;" in content
+

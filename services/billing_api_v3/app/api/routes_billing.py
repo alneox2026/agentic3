@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from services.billing_api_v3.app.core.auth import authenticate_request
 from services.billing_api_v3.app.core.errors import BillingApiError
+from services.billing_api_v3.app.services.cancellation_reconciliation import (
+    CancellationReconciliationService,
+)
 from services.billing_api_v3.app.services.checkout_service import CheckoutService
 from services.billing_api_v3.app.services.webhook_service import StripeWebhookService
 
@@ -89,3 +92,34 @@ async def stripe_webhook(
         stripe_signature=stripe_signature,
     )
     return StripeWebhookResponse(outcome=result.outcome, duplicate=result.duplicate)
+
+
+class CancellationReconciliationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool = True
+    scanned_intents: int
+    resolved_intents: int
+    completed_cancellations: int
+    failed_cancellations: int
+    skipped_intents: int
+
+
+@router.post(
+    "/internal/cancellation/reconcile",
+    response_model=CancellationReconciliationResponse,
+    include_in_schema=False,
+)
+async def reconcile_cancellation_intents() -> CancellationReconciliationResponse:
+    """Internal / Cloud Scheduler endpoint to reconcile pending & unresolved cancellation intents."""
+    service = CancellationReconciliationService()
+    result = await service.reconcile_intents()
+    return CancellationReconciliationResponse(
+        ok=True,
+        scanned_intents=result.scanned_intents,
+        resolved_intents=result.resolved_intents,
+        completed_cancellations=result.completed_cancellations,
+        failed_cancellations=result.failed_cancellations,
+        skipped_intents=result.skipped_intents,
+    )
+

@@ -776,13 +776,21 @@ class StripeWebhookService:
                 fulfillment=fulfillment,
                 processed_at=processed_at,
             )
+            is_same_sub = (account.get("stripe_subscription_id") == fulfillment.stripe_subscription_id)
+            is_locally_canceled = (account.get("subscription_status") == "canceled")
+            is_cancel_pending = bool(account.get("subscription_cancellation_pending"))
+
+            resolved_stripe_sub_status = fulfillment.subscription_status
+            if is_same_sub and (is_locally_canceled or is_cancel_pending) and fulfillment.subscription_status != "canceled":
+                resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
+
             transaction.update(
                 account_ref,
                 {
                     "stripe_customer_id": fulfillment.stripe_customer_id,
                     "stripe_customer_status": "ready",
                     "stripe_subscription_id": fulfillment.stripe_subscription_id,
-                    "stripe_subscription_status": fulfillment.subscription_status,
+                    "stripe_subscription_status": resolved_stripe_sub_status,
                     "stripe_subscription_current_period_start": fulfillment.subscription_period_start,
                     "stripe_subscription_current_period_end": fulfillment.subscription_period_end,
                     "last_service_fee_invoice_id": fulfillment.stripe_invoice_id,
@@ -1014,13 +1022,30 @@ class StripeWebhookService:
                 stripe_customer_id=stripe_customer_id,
             )
 
+            # Guard terminal cancellation state: if this subscription was already
+            # canceled (or cancellation is pending), do not allow stale concurrent
+            # updates to set stripe_subscription_status back to active/trialing/past_due.
+            is_same_sub = (account.get("stripe_subscription_id") == stripe_subscription_id)
+            is_locally_canceled = (account.get("subscription_status") == "canceled")
+            is_cancel_pending = bool(account.get("subscription_cancellation_pending"))
+
+            last_event_ts = account.get("last_subscription_event_created_at")
+            is_stale_event = bool(last_event_ts and stripe_event_created_at and stripe_event_created_at < last_event_ts)
+
+            resolved_stripe_sub_status = subscription_status
+            if is_same_sub and (is_locally_canceled or is_cancel_pending) and subscription_status != "canceled":
+                resolved_stripe_sub_status = "canceled" if is_locally_canceled else account.get("stripe_subscription_status", "canceled")
+            elif is_stale_event:
+                resolved_stripe_sub_status = account.get("stripe_subscription_status", subscription_status)
+
             account_updates = {
                 "stripe_customer_id": stripe_customer_id,
                 "stripe_customer_status": "ready",
                 "stripe_subscription_id": stripe_subscription_id,
-                "stripe_subscription_status": subscription_status,
+                "stripe_subscription_status": resolved_stripe_sub_status,
                 "stripe_subscription_current_period_start": period_start,
                 "stripe_subscription_current_period_end": period_end,
+                "last_subscription_event_created_at": stripe_event_created_at,
                 "updated_at": processed_at,
             }
             if last_invoice_id:
@@ -1935,10 +1960,13 @@ class StripeWebhookService:
         # out of order. Record a pending subscription now so a fast second
         # top-up cannot start a duplicate monthly subscription.
         if stripe_subscription_id and not _optional_id(account.get("stripe_subscription_id")):
+            is_locally_canceled = (account.get("subscription_status") == "canceled")
+            is_cancel_pending = bool(account.get("subscription_cancellation_pending"))
+            sub_status = "canceled" if is_locally_canceled else ("pending_cancellation" if is_cancel_pending else "pending_activation")
             updates.update(
                 {
                     "stripe_subscription_id": stripe_subscription_id,
-                    "stripe_subscription_status": "pending_activation",
+                    "stripe_subscription_status": sub_status,
                 }
             )
         transaction.update(account_ref, updates)

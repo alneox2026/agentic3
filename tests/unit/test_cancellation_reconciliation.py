@@ -1,0 +1,321 @@
+"""Unit tests for the subscription cancellation intent reconciliation service."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from common.billing import customer_billing_account_document_id
+from services.billing_api_v3.app.core.config import BillingApiSettings
+from services.billing_api_v3.app.services.cancellation_reconciliation import (
+    CancellationReconciliationService,
+)
+from services.billing_api_v3.app.services.firestore_records import (
+    build_initial_billing_account_document,
+)
+from services.billing_api_v3.app.services.stripe_gateway import StripeGatewayError
+
+
+class FakeSnapshot:
+    def __init__(self, data: Any, doc_id: str | None = None) -> None:
+        self._data = data
+        self.id = doc_id
+        self.exists = data is not None
+
+    def to_dict(self) -> dict[str, Any] | None:
+        return dict(self._data) if self._data is not None else None
+
+
+class FakeDocumentReference:
+    def __init__(self, client: Any, collection: str, document_id: str) -> None:
+        self.client = client
+        self.collection = collection
+        self.document_id = document_id
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.collection, self.document_id
+
+    def get(self) -> FakeSnapshot:
+        return FakeSnapshot(self.client.documents.get(self.key), self.document_id)
+
+
+class FakeCollectionReference:
+    def __init__(self, client: Any, collection: str) -> None:
+        self.client = client
+        self.collection_name = collection
+
+    def document(self, document_id: str) -> FakeDocumentReference:
+        return FakeDocumentReference(self.client, self.collection_name, document_id)
+
+    def stream(self) -> list[FakeSnapshot]:
+        snapshots = []
+        for (col, doc_id), data in self.client.documents.items():
+            if col == self.collection_name:
+                snapshots.append(FakeSnapshot(data, doc_id))
+        return snapshots
+
+
+class FakeTransaction:
+    def __init__(self, client: Any) -> None:
+        self.client = client
+        self._wrote = False
+
+    def get(self, document_ref: FakeDocumentReference) -> Any:
+        if self._wrote:
+            raise AssertionError("Firestore transaction read occurred after a write")
+        yield FakeSnapshot(self.client.documents.get(document_ref.key), document_ref.document_id)
+
+    def create(self, document_ref: FakeDocumentReference, data: dict[str, Any]) -> None:
+        self._wrote = True
+        self.client.documents[document_ref.key] = dict(data)
+
+    def update(self, document_ref: FakeDocumentReference, updates: dict[str, Any]) -> None:
+        self._wrote = True
+        if document_ref.key not in self.client.documents:
+            self.client.documents[document_ref.key] = {}
+        self.client.documents[document_ref.key].update(updates)
+
+
+class FakeFirestore:
+    def __init__(self) -> None:
+        self.documents: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def collection(self, collection: str) -> FakeCollectionReference:
+        return FakeCollectionReference(self, collection)
+
+    def transaction(self) -> FakeTransaction:
+        return FakeTransaction(self)
+
+
+class FakeStripeGateway:
+    def __init__(self) -> None:
+        self.cancelled_subscriptions: list[str] = []
+        self.cancel_error: Exception | None = None
+
+    def cancel_subscription(self, subscription_id: str) -> dict[str, Any]:
+        if self.cancel_error:
+            raise self.cancel_error
+        self.cancelled_subscriptions.append(subscription_id)
+        return {"id": subscription_id, "status": "canceled"}
+
+
+def _settings() -> BillingApiSettings:
+    return BillingApiSettings(
+        project_id="ceo-dev123",
+        region="us-central1",
+        log_level="INFO",
+        allowed_origins=[],
+        catalog_path=Path("config/billing.test.yaml"),
+        billing_accounts_collection="customer_billing_accounts",
+        stripe_webhook_events_collection="stripe_webhook_events",
+        wallets_collection="customer_wallets",
+        wallet_transactions_collection="wallet_transactions",
+        customer_billing_periods_collection="customer_billing_periods",
+        checkout_success_url="https://example.test/success",
+        checkout_cancel_url="https://example.test/cancelled",
+        checkout_session_ttl_seconds=1800,
+        stripe_webhook_tolerance_seconds=300,
+        subscription_cancellation_requests_collection="subscription_cancellation_requests",
+    )
+
+
+def test_reconcile_resolves_unresolved_intent_when_account_has_subscription_id() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_arrived_later",
+        "subscription_cancellation_pending": True,
+        "unresolved_cancellation_request_id": "re_unresolved_1",
+    }
+    client.documents[("subscription_cancellation_requests", "re_unresolved_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_unresolved_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": None,
+        "status": "unresolved",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    assert result.scanned_intents == 1
+    assert result.resolved_intents == 1
+    assert result.completed_cancellations == 1
+    assert result.failed_cancellations == 0
+    assert result.skipped_intents == 0
+
+    assert "sub_arrived_later" in stripe.cancelled_subscriptions
+    intent_doc = client.documents[("subscription_cancellation_requests", "re_unresolved_1")]
+    assert intent_doc["status"] == "completed"
+    assert intent_doc["stripe_subscription_id"] == "sub_arrived_later"
+
+    account_doc = client.documents[("customer_billing_accounts", account_id)]
+    assert account_doc["subscription_status"] == "canceled"
+    assert account_doc["stripe_subscription_status"] == "canceled"
+    assert account_doc["subscription_cancellation_pending"] is False
+    assert account_doc["unresolved_cancellation_request_id"] is None
+
+
+def test_reconcile_completes_pending_intent() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_pending_1",
+        "subscription_cancellation_pending": True,
+    }
+    client.documents[("subscription_cancellation_requests", "re_pending_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_pending_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_pending_1",
+        "status": "pending",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    assert result.scanned_intents == 1
+    assert result.completed_cancellations == 1
+    assert "sub_pending_1" in stripe.cancelled_subscriptions
+    intent_doc = client.documents[("subscription_cancellation_requests", "re_pending_1")]
+    assert intent_doc["status"] == "completed"
+
+
+def test_reconcile_skips_unresolved_when_account_still_missing_subscription_id() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": None,
+    }
+    client.documents[("subscription_cancellation_requests", "re_unresolved_missing")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_unresolved_missing",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": None,
+        "status": "unresolved",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    assert result.scanned_intents == 1
+    assert result.skipped_intents == 1
+    assert result.completed_cancellations == 0
+    intent_doc = client.documents[("subscription_cancellation_requests", "re_unresolved_missing")]
+    assert intent_doc["status"] == "unresolved"
+
+
+def test_reconcile_records_failure_and_increments_attempts_on_stripe_error() -> None:
+    now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+    account_id = customer_billing_account_document_id("user-1")
+
+    client = FakeFirestore()
+    client.documents[("customer_billing_accounts", account_id)] = {
+        **build_initial_billing_account_document(
+            billing_account_id=account_id,
+            billing_subject_id="user-1",
+            owner_uid="user-1",
+            catalog_environment="test",
+            created_at=now,
+        ),
+        "stripe_subscription_id": "sub_fail_1",
+    }
+    client.documents[("subscription_cancellation_requests", "re_fail_1")] = {
+        "schema_version": 1,
+        "cancellation_request_id": "re_fail_1",
+        "billing_account_id": account_id,
+        "billing_subject_id": "user-1",
+        "owner_uid": "user-1",
+        "stripe_subscription_id": "sub_fail_1",
+        "status": "pending",
+        "attempts": 1,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    stripe = FakeStripeGateway()
+    stripe.cancel_error = StripeGatewayError("Stripe API connection timed out")
+    service = CancellationReconciliationService(
+        firestore_client_factory=lambda: client,
+        stripe_gateway=stripe,
+        settings=_settings(),
+        now_factory=lambda: now,
+    )
+
+    result = service.reconcile_intents_sync()
+
+    assert result.scanned_intents == 1
+    assert result.failed_cancellations == 1
+    assert result.completed_cancellations == 0
+
+    intent_doc = client.documents[("subscription_cancellation_requests", "re_fail_1")]
+    assert intent_doc["status"] == "pending"
+    assert intent_doc["attempts"] == 2
+    assert "Stripe API connection timed out" in intent_doc["last_error"]
