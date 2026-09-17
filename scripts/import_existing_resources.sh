@@ -11,13 +11,24 @@ REGION="${REGION:-us-central1}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}/infra/terraform"
 
+EXTRA_IMPORT_VARS=()
+if [ ! -f terraform.auto.tfvars.json ]; then
+  EXTRA_IMPORT_VARS=(
+    -var="project_id=${PROJECT_ID}"
+    -var="region=${REGION}"
+    -var="gateway_image=placeholder"
+    -var="worker_image=placeholder"
+    -var="billing_api_image=placeholder"
+  )
+fi
+
 import_if_needed() {
   local tf_resource="$1"
   local gcp_id="$2"
 
   if ! terraform state list 2>/dev/null | grep -Fxq "${tf_resource}"; then
     echo "--> Checking/importing ${tf_resource} (${gcp_id})..."
-    terraform import -var="project_id=${PROJECT_ID}" -var="region=${REGION}" "${tf_resource}" "${gcp_id}" 2>/dev/null || true
+    terraform import "${EXTRA_IMPORT_VARS[@]}" "${tf_resource}" "${gcp_id}" || true
   else
     echo "    ${tf_resource} is already tracked in state."
   fi
@@ -45,7 +56,7 @@ import_if_needed "google_cloud_run_v2_service.worker" "projects/${PROJECT_ID}/lo
 import_if_needed "google_cloud_run_v2_service.billing_api" "projects/${PROJECT_ID}/locations/${REGION}/services/ceoagent-billing-api-v3"
 
 # Eventarc Trigger (if pre-existing)
-import_if_needed "google_eventarc_trigger.worker_turn_events" "projects/${PROJECT_ID}/locations/${REGION}/triggers/ceoagent-turn-events-trigger-v3"
+import_if_needed "google_eventarc_trigger.worker_turn_events" "projects/${PROJECT_ID}/locations/${REGION}/triggers/ceoagent-persistence-worker-v3-turn-events"
 
 # Cloud Scheduler Jobs (if pre-existing)
 import_if_needed "google_cloud_scheduler_job.billing_reconciliation" "projects/${PROJECT_ID}/locations/${REGION}/jobs/billing-expired-reservations-reconciler"

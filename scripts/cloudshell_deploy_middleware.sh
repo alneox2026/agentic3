@@ -14,31 +14,49 @@ cd "${ROOT_DIR}"
 
 # Auto-detect latest built digests or tags per service if not explicitly provided
 if [ -n "${TAG:-}" ] && [ "${TAG}" != "latest" ]; then
-  GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:${TAG}"
-  WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:${TAG}"
-  BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:${TAG}"
+  GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:${TAG}"
+  WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:${TAG}"
+  BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:${TAG}"
 else
   echo "--> Resolving :latest image digests from Artifact Registry..."
-  GATEWAY_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
-  WORKER_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
-  BILLING_API_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  GATEWAY_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:latest" --format='value(image_summary.digest)' 2>/dev/null || gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  WORKER_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:latest" --format='value(image_summary.digest)' 2>/dev/null || gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+  BILLING_API_DIGEST="$(gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:latest" --format='value(image_summary.digest)' 2>/dev/null || gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:latest" --format='value(image_summary.digest)' 2>/dev/null || true)"
+
+  if gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-gateway:latest" >/dev/null 2>&1; then
+    GATEWAY_NAME="managed-agents-gateway"
+  else
+    GATEWAY_NAME="ceoagent-gateway"
+  fi
+
+  if gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-worker:latest" >/dev/null 2>&1; then
+    WORKER_NAME="managed-agents-worker"
+  else
+    WORKER_NAME="ceoagent-persistence-worker"
+  fi
+
+  if gcloud artifacts docker images describe "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/managed-agents-billing-api:latest" >/dev/null 2>&1; then
+    BILLING_API_NAME="managed-agents-billing-api"
+  else
+    BILLING_API_NAME="ceoagent-billing-api"
+  fi
 
   if [ -n "${GATEWAY_DIGEST}" ]; then
-    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway@${GATEWAY_DIGEST}"
+    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${GATEWAY_NAME}@${GATEWAY_DIGEST}"
   else
-    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-gateway:latest"
+    GATEWAY_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${GATEWAY_NAME}:latest"
   fi
 
   if [ -n "${WORKER_DIGEST}" ]; then
-    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker@${WORKER_DIGEST}"
+    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${WORKER_NAME}@${WORKER_DIGEST}"
   else
-    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-persistence-worker:latest"
+    WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${WORKER_NAME}:latest"
   fi
 
   if [ -n "${BILLING_API_DIGEST}" ]; then
-    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api@${BILLING_API_DIGEST}"
+    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${BILLING_API_NAME}@${BILLING_API_DIGEST}"
   else
-    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/ceoagent-billing-api:latest"
+    BILLING_API_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${BILLING_API_NAME}:latest"
   fi
 fi
 # Auto-detect cluster suffix from the repo directory name (e.g. ceodev-v6 → v6)
@@ -76,7 +94,7 @@ terraform init -backend-config=backend.hcl -reconfigure
 BILLING_CATALOG_PATH="${BILLING_CATALOG_PATH:-/app/config/billing.prod.yaml}"
 EXTRA_TFVARS=",\"billing_api_catalog_path\": \"${BILLING_CATALOG_PATH}\""
 if [ -n "${STRIPE_WEBHOOK_SIGNING_SECRET_ID:-}" ]; then
-  EXTRA_TFVARS="${EXTRA_TFVARS},\"billing_api_stripe_webhook_signing_secret_id\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_ID}\""
+  EXTRA_TFVARS="${EXTRA_TFVARS},\"billing_api_stripe_webhook_signing_secret_id\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_ID}\",\"billing_api_stripe_webhook_signing_secret_version\": \"${STRIPE_WEBHOOK_SIGNING_SECRET_VERSION:-1}\""
 fi
 
 cat > terraform.auto.tfvars.json <<EOF
@@ -89,7 +107,6 @@ cat > terraform.auto.tfvars.json <<EOF
   "allowed_origins": ["https://ceoappdev.flutterflow.app"],
   "billing_api_allowed_origins": ["https://ceoappdev.flutterflow.app"],
   "billing_api_stripe_secret_key_secret_version": "1",
-  "billing_api_stripe_webhook_signing_secret_version": "1",
   "billing_api_checkout_success_url": "https://ceoappdev.flutterflow.app/billing-complete?session_id={CHECKOUT_SESSION_ID}",
   "billing_api_checkout_cancel_url": "https://ceoappdev.flutterflow.app/billing-cancelled",
   "billing_enforcement_enabled": true,
